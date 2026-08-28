@@ -824,43 +824,124 @@ cdef class VCF(HTSFile):
     def __iter__(self):
         return self
 
-    def __next__(self):
-
-        cdef bcf1_t *b
+    cdef int _bcf_read1(self, bcf1_t *b):
+        # read the next record into b, honoring the stripped-FORMAT path:
+        # unwanted FORMAT fields are removed from the text line before htslib
+        # parses it, mirroring what bcf_read does internally for VCF text.
+        # Returns bcf_read-style codes: >= 0 ok, -1 end-of-file, < -1 error.
         cdef int ret, newlen
         cdef char *ckeep
-        if self.hts == NULL:
-            raise Exception("attempt to iterate over closed/invalid VCF")
         if self._strip_fmt:
-            # read the text line ourselves so unwanted FORMAT fields can be
-            # stripped before htslib parses them; this mirrors what bcf_read
-            # does internally for VCF text.
             ckeep = self._fmt_keep
             with nogil:
                 ret = hts_getline(self.hts, KS_SEP_LINE, &self._line)
             if ret < 0:
-                if ret == -1:  # end-of-file
-                    raise StopIteration
-                raise Exception("error reading line from file, error-code: %d" % ret)
+                return ret
             with nogil:
                 newlen = vcf_line_strip_format(self._line.s, <int>self._line.l, ckeep)
                 if newlen >= 0:
                     self._line.l = <size_t>newlen
-                b = bcf_init()
                 ret = vcf_parse(&self._line, self.hdr, b)
-        else:
-            with nogil:
-                b = bcf_init()
-                ret = bcf_read(self.hts, self.hdr, b)
+            return ret
+        with nogil:
+            ret = bcf_read(self.hts, self.hdr, b)
+        return ret
+
+    def __next__(self):
+
+        cdef bcf1_t *b
+        cdef int ret, errcode
+        if self.hts == NULL:
+            raise Exception("attempt to iterate over closed/invalid VCF")
+        b = bcf_init()
+        ret = self._bcf_read1(b)
         if ret >= 0 or b.errcode == BCF_ERR_CTG_UNDEF:
             return newVariant(b, self)
-        else:
-            bcf_destroy(b)
+        errcode = b.errcode
+        bcf_destroy(b)
         if  ret == -1:  # end-of-file
             raise StopIteration
         else:
             raise Exception("error parsing variant with `htslib::bcf_read` error-code: %d and ret: %d" % (
-                b.errcode, ret))
+                errcode, ret))
+
+    def gt_types_chunk(self, int size, positions=False):
+        """read up to `size` variants and return their gt_types as one matrix.
+
+        The result is a numpy int8 array of shape (m, n_samples) with
+        m <= `size`; m is 0 once the file is exhausted. Call repeatedly to
+        stream a whole file. Row values match `Variant.gt_types` under this
+        reader's `gts012` and `strict_gt` settings (for `gts012=True`:
+        HOM_REF=0, HET=1, HOM_ALT=2, UNKNOWN=3; otherwise 2 and 3 are
+        swapped). No `Variant` objects are created, making this much faster
+        than per-variant iteration; it composes with `format_fields` and
+        `parse_threads` and consumes the same stream as iteration.
+
+        With positions=True, returns (matrix, positions) where positions is
+        an int64 numpy array of the variants' POS values.
+        """
+        if size < 0:
+            raise ValueError("gt_types_chunk: size must be >= 0")
+        if self.hts == NULL:
+            raise Exception("attempt to read from closed/invalid VCF")
+        cdef int n_samples = self.n_samples
+        if n_samples == 0:
+            raise Exception("gt_types_chunk: no samples in VCF")
+        cdef int hom_alt = 2 if self.gts012 else 3
+        cdef int unknown = 3 if self.gts012 else 2
+        cdef int strict = self.strict_gt
+        cdef np.ndarray out = np.empty((size, n_samples), dtype=np.int8)
+        cdef np.ndarray pos = np.empty((size,), dtype=np.int64)
+        cdef int8_t *out_p = <int8_t *>np.PyArray_DATA(out)
+        cdef int64_t *pos_p = <int64_t *>np.PyArray_DATA(pos)
+        cdef bint want_pos = bool(positions)
+        cdef bcf1_t *b = bcf_init()
+        cdef bcf_fmt_t *fmt
+        cdef int32_t *tmp = NULL
+        cdef int ntmp = 0
+        cdef int m = 0, ret = 0, gt_id, nper, n, i, errcode
+        try:
+            while m < size:
+                ret = self._bcf_read1(b)
+                if ret < 0 and b.errcode != BCF_ERR_CTG_UNDEF:
+                    break
+                if self._gt_fmt_id == -2:
+                    gt_id = bcf_hdr_id2int(self.hdr, BCF_DT_ID, "GT")
+                    if gt_id >= 0 and bcf_hdr_idinfo_exists(self.hdr, BCF_HL_FMT, gt_id) != 0:
+                        self._gt_fmt_id = gt_id
+                fmt = NULL
+                if self._gt_fmt_id >= 0:
+                    fmt = bcf_get_fmt_id(b, self._gt_fmt_id)
+                if fmt != NULL and fmt.type == BCF_BT_INT8 and fmt.n > 0 and fmt.p != NULL:
+                    gt_types_012_row_from_int8(<int8_t *>fmt.p, n_samples, fmt.n,
+                                               strict, hom_alt, unknown,
+                                               out_p + <size_t>m * n_samples)
+                else:
+                    # GT stored wider than int8 (very many alleles), or absent
+                    n = bcf_get_genotypes(self.hdr, b, &tmp, &ntmp)
+                    if n <= 0 or n // n_samples == 0:
+                        raise Exception("error parsing genotypes; they may be absent from this record")
+                    nper = n // n_samples
+                    as_gts(tmp, n_samples, nper, strict, hom_alt, unknown)
+                    for i in range(n_samples):
+                        out_p[<size_t>m * n_samples + i] = <int8_t>tmp[i]
+                if want_pos:
+                    pos_p[m] = b.pos + 1
+                m += 1
+            if m < size and ret != -1:  # mirror __next__'s error behaviour
+                errcode = b.errcode
+                raise Exception("error parsing variant with `htslib::bcf_read` error-code: %d and ret: %d" % (
+                    errcode, ret))
+        finally:
+            if tmp != NULL:
+                stdlib.free(tmp)
+            bcf_destroy(b)
+        if m < size:
+            out.resize((m, n_samples), refcheck=False)
+            pos.resize((m,), refcheck=False)
+        if want_pos:
+            return out, pos
+        return out
 
 
     property samples:

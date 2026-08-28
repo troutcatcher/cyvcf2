@@ -1,4 +1,10 @@
 # v0.34.0
++ add `VCF.gt_types_chunk(size, positions=False)`: bulk reader returning the
+  gt_types of up to `size` variants as one int8 numpy matrix (rows follow the
+  reader's gts012/strict_gt settings), without creating per-variant objects
+  or per-variant arrays. Building a whole-file genotype matrix this way is
+  ~1.8x faster than `np.array([v.gt_types for v in vcf])` and uses int8
+  instead of int32; it composes with `format_fields` and `parse_threads`.
 + add `VCF(..., parse_threads=N)`: threaded parsing of VCF text via htslib's
   new `bcf_set_parse_threads` (ignored with a warning on htslib builds
   without it). On the Beagle-style benchmark (GT:DS:GP, 2000 samples x 34k

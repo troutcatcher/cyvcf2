@@ -62,6 +62,63 @@ static void gt012_tables_init(void) {
     gt012_tables_ready = 1;
 }
 
+// Row-writer used by the bulk gt_types reader: identical classification to
+// gt_types_012_from_int8 below, but writes only the int8 0/1/2/3 codes (no
+// allele indexes or phasing) straight into one row of the caller's matrix.
+// Callers hold the GIL, which serializes the lazy table initialization.
+int gt_types_012_row_from_int8(const int8_t *data, int num_samples, int ploidy,
+                               int strict_gt, int HOM_ALT, int UNKNOWN,
+                               int8_t *out) {
+    int j = 0, i, k;
+    const int ngts = num_samples * ploidy;
+
+    if (!gt012_tables_ready) gt012_tables_init();
+
+    if (ploidy == 2) {
+        const int shift = strict_gt ? 4 : 0;
+        int8_t class_map[4];
+        class_map[GT012_HOM_REF] = 0;
+        class_map[GT012_HET] = 1;
+        class_map[GT012_HOM_ALT] = (int8_t)HOM_ALT;
+        class_map[GT012_UNKNOWN] = (int8_t)UNKNOWN;
+        for (i = 0, j = 0; j < num_samples; i += 2, j++) {
+            unsigned r0 = (uint8_t)data[i], r1 = (uint8_t)data[i + 1];
+            out[j] = class_map[(gt012_pair_table[(r0 << 8) | r1] >> shift) & 0xF];
+        }
+        return j;
+    }
+
+    for (i = 0; i < ngts; i += ploidy) {
+        int missing = 0;
+        for (k = 0; k < ploidy; k++) {
+            if (bcf_gt_is_missing(gt8_to_i32(data[i + k]))) missing += 1;
+        }
+        if (missing == ploidy || (missing != 0 && strict_gt == 1)) {
+            out[j++] = (int8_t)UNKNOWN;
+            continue;
+        }
+        if (ploidy == 1 || data[i + 1] == bcf_int8_vector_end) {
+            int a = bcf_gt_allele(data[i]);
+            out[j++] = a == 0 ? 0 : (a == 1 ? (int8_t)HOM_ALT : (int8_t)UNKNOWN);
+            continue;
+        }
+        {
+            int a = bcf_gt_allele(data[i]);
+            int b = bcf_gt_allele(data[i + 1]);
+            if ((a == 0 && b == 0) || (missing > 0 && (a == 0 || b == 0))) {
+                out[j++] = 0; // HOM_REF (incl. e.g. 0/. which has no alts)
+            } else if (a == 1 && b == 1) {
+                out[j++] = (int8_t)HOM_ALT;
+            } else if (a != b) {
+                out[j++] = 1; // HET
+            } else {
+                out[j++] = (int8_t)HOM_ALT;
+            }
+        }
+    }
+    return j;
+}
+
 // Single-pass version of the gt_types pipeline for the common case where
 // htslib stores GT with per-value type BCF_BT_INT8 (fewer than ~64 alleles).
 // It reads the packed int8 FORMAT data directly (no intermediate int32 copy)

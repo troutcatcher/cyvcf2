@@ -1332,6 +1332,61 @@ def test_parse_threads(tmp_path, extra):
     assert serial == threaded
 
 
+def test_gt_types_chunk(tmp_path):
+    # the bulk reader must match per-variant gt_types across genotype forms
+    # (missing, half-missing, haploid, mixed ploidy, multi-allelic, and the
+    # int16-GT fallback for allele indexes > 63), flags, and chunk boundaries.
+    gts8 = ["0/0", "0/1", "1/1", "0|1", "1|1", "./.", "0/.", "./1", "1/2", "2/2", ".", "0", "1"]
+    gts16 = gts8[:8] + ["1/64", "64/64"] + gts8[10:]
+    alt = ",".join("A" * (i + 2) for i in range(70))
+    path = str(tmp_path / "chunk.vcf")
+    with open(path, "w") as fh:
+        fh.write("##fileformat=VCFv4.2\n")
+        fh.write("##contig=<ID=1,length=10000>\n")
+        fh.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+        fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+                 + "\t".join("S%d" % i for i in range(len(gts8))) + "\n")
+        for i in range(20):
+            fh.write("1\t%d\t.\tA\t%s\t30\tPASS\t.\tGT\t%s\n"
+                     % (100 + i, alt, "\t".join(gts16 if i % 3 == 0 else gts8)))
+
+    for f in (path, os.path.join(HERE, "test.vcf.gz")):
+        for gts012 in (False, True):
+            for strict_gt in (False, True):
+                ref = np.array([v.gt_types.copy() for v in
+                                VCF(f, gts012=gts012, strict_gt=strict_gt)]).astype(np.int8)
+                refpos = [v.POS for v in VCF(f)]
+                vcf = VCF(f, gts012=gts012, strict_gt=strict_gt)
+                chunks, poss = [], []
+                while True:
+                    mat, pos = vcf.gt_types_chunk(7, positions=True)
+                    assert mat.dtype == np.int8
+                    if mat.shape[0] == 0:
+                        break
+                    chunks.append(mat)
+                    poss.append(pos)
+                vcf.close()
+                got = np.vstack(chunks)
+                assert got.shape == ref.shape, (f, gts012, strict_gt)
+                assert np.array_equal(got, ref), (f, gts012, strict_gt)
+                assert np.concatenate(poss).tolist() == refpos
+
+    # after EOF, further calls return an empty matrix
+    vcf = VCF(path, gts012=True)
+    assert vcf.gt_types_chunk(1000).shape == (20, len(gts8))
+    assert vcf.gt_types_chunk(1000).shape == (0, len(gts8))
+    vcf.close()
+
+    # composes with format_fields
+    ref = np.array([v.gt_types.copy() for v in VCF(path, gts012=True)]).astype(np.int8)
+    vcf = VCF(path, gts012=True, format_fields=["GT"])
+    assert np.array_equal(vcf.gt_types_chunk(1000), ref)
+    vcf.close()
+
+    with pytest.raises(ValueError):
+        VCF(path).gt_types_chunk(-1)
+
+
 def test_alt_repr():
     v = os.path.join(HERE, "test-alt-repr.vcf")
     vcf = VCF(v, gts012=True, strict_gt=False)
