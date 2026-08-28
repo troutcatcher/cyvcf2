@@ -162,6 +162,18 @@ int cyvcf2_hdr_set_parse_formats(bcf_hdr_t *hdr, const char *fmts) {
 #endif
 }
 
+// use htslib's threaded VCF text parsing when this htslib provides it
+// (bcf_set_parse_threads); otherwise report -2 so the caller can warn.
+int cyvcf2_set_parse_threads(htsFile *fp, int n) {
+#ifdef CYVCF2_HAVE_PARSE_THREADS
+    return bcf_set_parse_threads(fp, n);
+#else
+    (void)fp;
+    (void)n;
+    return -2;
+#endif
+}
+
 // does the comma-separated list `keep` contain the name at name[0..len)?
 static int keep_has(const char *keep, const char *name, int len) {
     const char *p = keep;

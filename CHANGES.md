@@ -1,4 +1,13 @@
 # v0.34.0
++ add `VCF(..., parse_threads=N)`: threaded parsing of VCF text via htslib's
+  new `bcf_set_parse_threads` (ignored with a warning on htslib builds
+  without it). On the Beagle-style benchmark (GT:DS:GP, 2000 samples x 34k
+  variants, vcf.gz) a full parse drops from 17.5s to 4.7s with
+  `parse_threads=4`, and to 2.4s combined with `format_fields=["GT"]` —
+  about 8x faster than cyvcf2 v0.34.0 before this branch.
++ the bundled htslib submodule now points at the troutcatcher/htslib fork
+  (branch `claude/lazy-format-parse`, htslib 1.19 plus
+  `bcf_hdr_set_parse_formats` and `bcf_set_parse_threads`).
 + add `VCF(..., format_fields=["GT"])`: when reading VCF text (.vcf/.vcf.gz),
   parse only the listed FORMAT fields — every other field is stripped from
   each line by a cheap scan before it reaches htslib, so their values are

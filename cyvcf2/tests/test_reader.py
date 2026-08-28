@@ -1301,6 +1301,37 @@ def test_format_fields_lazy_parsing(tmp_path, monkeypatch, force_strip):
         VCF(path, format_fields=[])
 
 
+@pytest.mark.parametrize("extra", [{}, {"format_fields": ["GT"]}])
+def test_parse_threads(tmp_path, extra):
+    # threaded VCF text parsing must yield the same records in the same
+    # order as serial parsing, including a record with an undeclared INFO
+    # tag (which forces a serial re-parse mid-file). On builds without
+    # htslib support, parse_threads warns and reads serially, so the
+    # assertions still hold.
+    path = str(tmp_path / "mt.vcf")
+    with open(path, "w") as fh:
+        fh.write("##fileformat=VCFv4.2\n")
+        fh.write("##contig=<ID=1,length=10000000>\n")
+        fh.write('##INFO=<ID=AF,Number=A,Type=Float,Description="af">\n')
+        fh.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="g">\n')
+        fh.write('##FORMAT=<ID=DS,Number=A,Type=Float,Description="d">\n')
+        fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\tS2\n")
+        gts = ["0|1", "1|1", "0/0", "./.", "0/1"]
+        for i in range(800):
+            info = "XY=3" if i == 500 else "AF=0.5"
+            cells = "\t".join("%s:0.5" % gts[(i + j) % len(gts)] for j in range(3))
+            fh.write("1\t%d\t.\tA\tT\t30\tPASS\t%s\tGT:DS\t%s\n" % (i + 1, info, cells))
+
+    serial = [(v.POS, v.gt_types.tolist(), v.gt_phases.tolist(), v.FORMAT)
+              for v in VCF(path, gts012=True, **extra)]
+    vcf = VCF(path, gts012=True, parse_threads=2, **extra)
+    threaded = [(v.POS, v.gt_types.tolist(), v.gt_phases.tolist(), v.FORMAT)
+                for v in vcf]
+    vcf.close()
+    assert len(serial) == 800
+    assert serial == threaded
+
+
 def test_alt_repr():
     v = os.path.join(HERE, "test-alt-repr.vcf")
     vcf = VCF(v, gts012=True, strict_gt=False)

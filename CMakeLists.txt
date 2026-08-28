@@ -273,6 +273,12 @@ if(CYVCF2_HTSLIB_MODE STREQUAL "BUILTIN")
     message(STATUS "cyvcf2: htslib provides bcf_hdr_set_parse_formats; enabling native lazy FORMAT parsing")
     target_compile_definitions(cyvcf2_extension PRIVATE CYVCF2_HAVE_PARSE_FORMATS=1)
   endif()
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/htslib/htslib/vcf.h"
+       CYVCF2_PARSE_THREADS_DECL REGEX "bcf_set_parse_threads")
+  if(CYVCF2_PARSE_THREADS_DECL)
+    message(STATUS "cyvcf2: htslib provides bcf_set_parse_threads; enabling threaded VCF parsing")
+    target_compile_definitions(cyvcf2_extension PRIVATE CYVCF2_HAVE_PARSE_THREADS=1)
+  endif()
 endif()
 
 if(CYVCF2_HTSLIB_TARGET)

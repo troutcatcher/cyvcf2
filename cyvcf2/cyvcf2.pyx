@@ -293,6 +293,13 @@ cdef class VCF(HTSFile):
         FORMAT fields considerably (e.g. imputed VCFs with GT:DS:GP where only
         GT is needed). Ignored (with a warning) for BCF input, where records
         are already binary and skipping fields would not save parsing time.
+    parse_threads: int
+        parse VCF text with this many worker threads (requires an htslib
+        providing ``bcf_set_parse_threads``; ignored with a warning
+        otherwise). This parallelizes the record parsing itself and is
+        independent of ``threads``, which parallelizes bgzf decompression.
+        The reader prefetches records, so create a separate ``VCF`` instance
+        for region queries instead of mixing them with iteration on this one.
 
 
     Returns
@@ -340,7 +347,7 @@ cdef class VCF(HTSFile):
         self._line.s, self._line.l, self._line.m = NULL, 0, 0
 
     def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None,
-                 format_fields=None):
+                 format_fields=None, parse_threads=None):
         cdef bcf_hdr_t *hdr
         self._open_htsfile(fname, mode)
         hdr = self.hdr = bcf_hdr_read(self.hts)
@@ -382,6 +389,17 @@ cdef class VCF(HTSFile):
                     self._fmt_native = True
                 else:
                     self._strip_fmt = True
+        if parse_threads is not None and int(parse_threads) > 0:
+            if self._strip_fmt:
+                # the stripping read path bypasses bcf_read, where the
+                # threaded parser lives
+                warnings.warn("parse_threads is ignored when format_fields falls back to line stripping")
+            else:
+                ret = cyvcf2_set_parse_threads(self.hts, int(parse_threads))
+                if ret == -2:
+                    warnings.warn("parse_threads requires an htslib providing bcf_set_parse_threads; ignored for this build")
+                elif ret != 0:
+                    warnings.warn("parse_threads is only applied when reading VCF text (.vcf/.vcf.gz); it is ignored for this file")
 
     @property
     def lazy_format_mode(self):

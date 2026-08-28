@@ -26,6 +26,7 @@ cdef extern from "helpers.h":
                                int32_t *gt_phased);
     int vcf_line_strip_format(char *line, int len, const char *keep) nogil;
     int cyvcf2_hdr_set_parse_formats(bcf_hdr_t *hdr, const char *fmts);
+    int cyvcf2_set_parse_threads(htsFile *fp, int n);
     int32_t* bcf_hdr_seqlen(const bcf_hdr_t *hdr, int32_t *nseq)
 
 cdef extern from "htslib/kstring.h":
