@@ -20,6 +20,10 @@ cdef extern from "relatedness.h":
 
 cdef extern from "helpers.h":
     int as_gts(int32_t *gts, int num_samples, int ploidy, int strict_gt, int HOM_ALT, int UNKNOWN);
+    int gt_types_012_from_int8(const int8_t *data, int num_samples, int ploidy,
+                               int strict_gt, int HOM_ALT, int UNKNOWN,
+                               int32_t *gt_types, int32_t *gt_idxs,
+                               int32_t *gt_phased);
     int32_t* bcf_hdr_seqlen(const bcf_hdr_t *hdr, int32_t *nseq)
 
 cdef extern from "htslib/kstring.h":
@@ -151,7 +155,10 @@ cdef extern from "htslib/vcf.h":
 
     ctypedef struct bcf_fmt_t:
         int id;
-        int n; # n
+        int n; # n: number of values per-sample
+        int size; # size: number of bytes per-sample
+        int type; # type: one of BCF_BT_* types
+        uint8_t *p; # data array
 
     ctypedef struct bcf_info_t:
         int key;        # key: numeric tag id, the corresponding string is bcf_hdr_t::id[BCF_DT_ID][$key].key
@@ -281,6 +288,8 @@ cdef extern from "htslib/vcf.h":
 
 
     bcf_fmt_t *bcf_get_fmt(const bcf_hdr_t *hdr, bcf1_t *line, const char *key);
+    bcf_fmt_t *bcf_get_fmt_id(bcf1_t *line, const int id);
+    int bcf_hdr_idinfo_exists(const bcf_hdr_t *hdr, int type, int id);
 
     int bcf_get_genotypes(const bcf_hdr_t *hdr, bcf1_t *line, int32_t **dst, int *ndst);
     int bcf_get_format_int32(const bcf_hdr_t *hdr, bcf1_t *line, char * tag, int **dst, int *ndst);

@@ -304,6 +304,9 @@ cdef class VCF(HTSFile):
     cdef list _seqlens
     # holds a lookup of format field -> type.
     cdef dict format_types
+    # cached header id of the GT format field. -2 until the first successful
+    # lookup so a header that gains GT later is still found.
+    cdef int _gt_fmt_id
 
     #: The constant used to indicate the the genotype is HOM_REF.
     cdef readonly int HOM_REF
@@ -313,6 +316,9 @@ cdef class VCF(HTSFile):
     cdef readonly int HOM_ALT
     #: The constant used to indicate the the genotype is UNKNOWN.
     cdef readonly int UNKNOWN
+
+    def __cinit__(self, *args, **kwargs):
+        self._gt_fmt_id = -2
 
     def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None):
         cdef bcf_hdr_t *hdr
@@ -1693,35 +1699,63 @@ cdef class Variant(object):
         def __get__(self):
             cdef int ndst = 0, ngts, n, i, nper, j = 0, k = 0
             cdef int a
-            if self.vcf.n_samples == 0:
+            cdef int gt_id
+            cdef int n_samples = self.vcf.n_samples
+            cdef bcf_fmt_t *fmt = NULL
+            if n_samples == 0:
                 return np.array([])
             if self._gt_types == NULL:
-                self._gt_phased = <int *>stdlib.malloc(sizeof(int) * self.vcf.n_samples)
-                ngts = bcf_get_genotypes(self.vcf.hdr, self.b, &self._gt_types, &ndst)
-                if ngts < 0:
-                    raise Exception("error parsing genotypes; they may be absent from this record")
-                nper = int(ngts / self.vcf.n_samples)
-                self._ploidy = nper
-                self._gt_idxs = <int *>stdlib.malloc(sizeof(int) * self.vcf.n_samples * nper)
-                if ngts == 0 or nper == 0:
-                    return np.array([])
-                for i in range(0, ngts, nper):
-                    for k in range(i, i + nper):
-                        a = self._gt_types[k]
-                        if a >= 0:
-                            self._gt_idxs[k] = bcf_gt_allele(a)
-                        else:
-                            self._gt_idxs[k] = a
-
-                    self._gt_phased[j] = self._gt_types[i] > 0 and <int>bcf_gt_is_phased(self._gt_types[i+1])
-                    j += 1
-
-                if self.vcf.gts012:
-                    n = as_gts(self._gt_types, self.vcf.n_samples, nper, self.vcf.strict_gt, 2, 3)
+                # fast path: htslib nearly always stores GT as int8; convert
+                # the packed data to the 012 types, allele indexes, and phasing
+                # in a single pass without the intermediate int32 copy made by
+                # bcf_get_genotypes.
+                if self.vcf._gt_fmt_id == -2:
+                    gt_id = bcf_hdr_id2int(self.vcf.hdr, BCF_DT_ID, "GT")
+                    if gt_id >= 0 and bcf_hdr_idinfo_exists(self.vcf.hdr, BCF_HL_FMT, gt_id) != 0:
+                        self.vcf._gt_fmt_id = gt_id
+                if self.vcf._gt_fmt_id >= 0:
+                    fmt = bcf_get_fmt_id(self.b, self.vcf._gt_fmt_id)
+                if fmt != NULL and fmt.type == BCF_BT_INT8 and fmt.n > 0 and fmt.p != NULL:
+                    nper = fmt.n
+                    self._ploidy = nper
+                    self._gt_types = <int32_t *>stdlib.malloc(sizeof(int32_t) * n_samples)
+                    self._gt_idxs = <int *>stdlib.malloc(sizeof(int) * n_samples * nper)
+                    self._gt_phased = <int *>stdlib.malloc(sizeof(int) * n_samples)
+                    if self.vcf.gts012:
+                        gt_types_012_from_int8(<int8_t *>fmt.p, n_samples, nper,
+                                               self.vcf.strict_gt, 2, 3, self._gt_types,
+                                               <int32_t *>self._gt_idxs, <int32_t *>self._gt_phased)
+                    else:
+                        gt_types_012_from_int8(<int8_t *>fmt.p, n_samples, nper,
+                                               self.vcf.strict_gt, 3, 2, self._gt_types,
+                                               <int32_t *>self._gt_idxs, <int32_t *>self._gt_phased)
                 else:
-                    n = as_gts(self._gt_types, self.vcf.n_samples, nper, self.vcf.strict_gt, 3, 2)
+                    self._gt_phased = <int *>stdlib.malloc(sizeof(int) * n_samples)
+                    ngts = bcf_get_genotypes(self.vcf.hdr, self.b, &self._gt_types, &ndst)
+                    if ngts < 0:
+                        raise Exception("error parsing genotypes; they may be absent from this record")
+                    nper = ngts // n_samples
+                    self._ploidy = nper
+                    self._gt_idxs = <int *>stdlib.malloc(sizeof(int) * n_samples * nper)
+                    if ngts == 0 or nper == 0:
+                        return np.array([])
+                    for i in range(0, ngts, nper):
+                        for k in range(i, i + nper):
+                            a = self._gt_types[k]
+                            if a >= 0:
+                                self._gt_idxs[k] = bcf_gt_allele(a)
+                            else:
+                                self._gt_idxs[k] = a
+
+                        self._gt_phased[j] = self._gt_types[i] > 0 and <int>bcf_gt_is_phased(self._gt_types[i+1])
+                        j += 1
+
+                    if self.vcf.gts012:
+                        n = as_gts(self._gt_types, n_samples, nper, self.vcf.strict_gt, 2, 3)
+                    else:
+                        n = as_gts(self._gt_types, n_samples, nper, self.vcf.strict_gt, 3, 2)
             cdef np.npy_intp shape[1]
-            shape[0] = <np.npy_intp> self.vcf.n_samples
+            shape[0] = <np.npy_intp> n_samples
             return np.PyArray_SimpleNewFromData(1, shape, np.NPY_INT32, self._gt_types)
 
     property ploidy:

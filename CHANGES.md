@@ -1,4 +1,10 @@
 # v0.34.0
++ speed up `gt_types` (012 genotype parsing): the common int8-encoded GT case
+  now converts htslib's packed FORMAT data to the 012 types, allele indexes,
+  and phasing in a single table-driven C pass instead of three passes over an
+  intermediate int32 copy, and the GT header id is cached per VCF. Reading
+  `gt_types` on a 2000-sample VCF is ~25% faster end-to-end; the per-variant
+  overhead on top of parsing drops ~15x.
 + drop support for end-of-life Python 3.8 (minimum is now 3.9)
 + add PyPI trove classifiers (Python 3.9–3.14)
 + bump cibuildwheel to v4 and drop the stale prerelease-pythons flag

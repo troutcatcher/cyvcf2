@@ -1186,6 +1186,46 @@ def test_strict_gt_option_flag():
     assert tuple(variant.genotypes) == truth_genotypes, '{} (genotypes)'.format(msg)
     """
 
+def test_gt_types_012_fast_path(tmp_path):
+    # exercise the single-pass int8 gt_types path against every genotype form
+    # and against the generic bcf_get_genotypes path (GT stored as int16 when
+    # an allele index is > 63); both records must classify identically.
+    gts8 = ["0/0", "0/1", "1/1", "0|1", "1|1", "./.", "0/.", "./1", "1/2", "2/2", ".", "0", "1"]
+    gts16 = gts8[:8] + ["1/64", "64/64"] + gts8[10:]
+    alt = ",".join("A" * (i + 2) for i in range(70))
+    path = str(tmp_path / "gt012.vcf")
+    with open(path, "w") as fh:
+        fh.write("##fileformat=VCFv4.2\n")
+        fh.write("##contig=<ID=1,length=10000>\n")
+        fh.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+        fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+                 + "\t".join("S%d" % i for i in range(len(gts8))) + "\n")
+        fh.write("1\t100\t.\tA\t%s\t30\tPASS\t.\tGT\t%s\n" % (alt, "\t".join(gts8)))
+        fh.write("1\t200\t.\tA\t%s\t30\tPASS\t.\tGT\t%s\n" % (alt, "\t".join(gts16)))
+
+    expected = {
+        # (gts012, strict_gt) -> gt_types for gts8 (and, by construction, gts16)
+        (False, False): [0, 1, 3, 1, 3, 2, 0, 1, 1, 3, 2, 0, 3],
+        (False, True): [0, 1, 3, 1, 3, 2, 2, 2, 1, 3, 2, 0, 3],
+        (True, False): [0, 1, 2, 1, 2, 3, 0, 1, 1, 2, 3, 0, 2],
+        (True, True): [0, 1, 2, 1, 2, 3, 3, 3, 1, 2, 3, 0, 2],
+    }
+    expected_phases = [False, False, False, True, True, False, False, False,
+                       False, False, False, True, True]
+
+    for (gts012, strict_gt), exp in expected.items():
+        vcf = VCF(path, gts012=gts012, strict_gt=strict_gt)
+        v8, v16 = list(vcf)
+        assert v8.ploidy == 2
+        assert v8.gt_types.tolist() == exp, (gts012, strict_gt, v8.gt_types.tolist())
+        assert v8.gt_phases.tolist() == expected_phases
+        assert v16.gt_types.tolist() == v8.gt_types.tolist(), (gts012, strict_gt)
+        assert v16.gt_phases.tolist() == v8.gt_phases.tolist()
+        # allele indexes > 63 survive the int16 path
+        assert v16.gt_bases[9] == "A" * 65 + "/" + "A" * 65
+        vcf.close()
+
+
 def test_alt_repr():
     v = os.path.join(HERE, "test-alt-repr.vcf")
     vcf = VCF(v, gts012=True, strict_gt=False)
