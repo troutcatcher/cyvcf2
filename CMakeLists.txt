@@ -262,6 +262,19 @@ if(CMAKE_C_COMPILER_ID MATCHES "^(AppleClang|Clang)$")
   target_compile_options(cyvcf2_extension PRIVATE -Wno-incompatible-pointer-types-discards-qualifiers)
 endif()
 
+# Enable native lazy FORMAT parsing when the bundled htslib provides
+# bcf_hdr_set_parse_formats (only checked for BUILTIN mode, where the compile
+# headers are guaranteed to match the linked library); without it, cyvcf2
+# falls back to stripping unwanted FORMAT fields from each line itself.
+if(CYVCF2_HTSLIB_MODE STREQUAL "BUILTIN")
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/htslib/htslib/vcf.h"
+       CYVCF2_PARSE_FORMATS_DECL REGEX "bcf_hdr_set_parse_formats")
+  if(CYVCF2_PARSE_FORMATS_DECL)
+    message(STATUS "cyvcf2: htslib provides bcf_hdr_set_parse_formats; enabling native lazy FORMAT parsing")
+    target_compile_definitions(cyvcf2_extension PRIVATE CYVCF2_HAVE_PARSE_FORMATS=1)
+  endif()
+endif()
+
 if(CYVCF2_HTSLIB_TARGET)
   target_link_libraries(cyvcf2_extension PRIVATE ${CYVCF2_HTSLIB_TARGET})
 endif()

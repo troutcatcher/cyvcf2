@@ -320,6 +320,7 @@ cdef class VCF(HTSFile):
     # vcf_parse so htslib never pays to convert them.
     cdef bytes _fmt_keep
     cdef bint _strip_fmt
+    cdef bint _fmt_native
     # line buffer for the stripped-FORMAT read path
     cdef kstring_t _line
 
@@ -335,6 +336,7 @@ cdef class VCF(HTSFile):
     def __cinit__(self, *args, **kwargs):
         self._gt_fmt_id = -2
         self._strip_fmt = False
+        self._fmt_native = False
         self._line.s, self._line.l, self._line.m = NULL, 0, 0
 
     def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None,
@@ -372,7 +374,29 @@ cdef class VCF(HTSFile):
                 warnings.warn("format_fields is only applied when reading VCF text (.vcf/.vcf.gz); it is ignored for this file")
             else:
                 self._fmt_keep = b",".join(names)
-                self._strip_fmt = True
+                # prefer htslib-native lazy parsing when built against an
+                # htslib providing bcf_hdr_set_parse_formats; otherwise strip
+                # unwanted fields from each line before it reaches vcf_parse.
+                if (os.environ.get("CYVCF2_NO_NATIVE_LAZY_FMT") is None and
+                        cyvcf2_hdr_set_parse_formats(<bcf_hdr_t *>self.hdr, self._fmt_keep) == 0):
+                    self._fmt_native = True
+                else:
+                    self._strip_fmt = True
+
+    @property
+    def lazy_format_mode(self):
+        """how ``format_fields`` is implemented for this reader.
+
+        "native" when htslib itself parses only the requested FORMAT fields
+        (bcf_hdr_set_parse_formats), "strip" when cyvcf2 strips unwanted
+        fields from each line before parsing, None when ``format_fields`` was
+        not given or does not apply.
+        """
+        if self._fmt_native:
+            return "native"
+        if self._strip_fmt:
+            return "strip"
+        return None
 
     def __enter__(self):
         return self

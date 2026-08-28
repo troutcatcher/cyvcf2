@@ -149,6 +149,19 @@ int gt_types_012_from_int8(const int8_t *data, int num_samples, int ploidy,
     return j;
 }
 
+// use htslib's native lazy FORMAT parsing when this htslib provides it
+// (bcf_hdr_set_parse_formats); otherwise report -2 so the caller falls back
+// to stripping the line itself.
+int cyvcf2_hdr_set_parse_formats(bcf_hdr_t *hdr, const char *fmts) {
+#ifdef CYVCF2_HAVE_PARSE_FORMATS
+    return bcf_hdr_set_parse_formats(hdr, fmts);
+#else
+    (void)hdr;
+    (void)fmts;
+    return -2;
+#endif
+}
+
 // does the comma-separated list `keep` contain the name at name[0..len)?
 static int keep_has(const char *keep, const char *name, int len) {
     const char *p = keep;
@@ -202,9 +215,25 @@ int vcf_line_strip_format(char *line, int len, const char *keep) {
     for (i = 0; i < n_fmt; i++) {
         if (keep_has(keep, fs[i], fl[i])) kept[n_kept++] = i;
     }
-    if (n_kept == 0 || n_kept == n_fmt) return -1;
+    if (n_kept == n_fmt) return -1;
 
     w = fmt_start;
+    if (n_kept == 0) {
+        // none of the kept fields is present: drop the FORMAT data entirely
+        // ("." columns), matching bcf_hdr_set_parse_formats() semantics
+        *w++ = '.';
+        r = fmt_end;
+        while (r < end) {
+            *w++ = '\t';
+            r++;
+            char *cell_end = memchr(r, '\t', end - r);
+            if (cell_end == NULL) cell_end = end;
+            *w++ = '.';
+            r = cell_end;
+        }
+        *w = '\0';
+        return (int)(w - line);
+    }
     for (i = 0; i < n_kept; i++) {
         if (i) *w++ = ':';
         memmove(w, fs[kept[i]], fl[kept[i]]);

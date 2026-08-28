@@ -1226,9 +1226,14 @@ def test_gt_types_012_fast_path(tmp_path):
         vcf.close()
 
 
-def test_format_fields_lazy_parsing(tmp_path):
-    # format_fields strips unrequested FORMAT fields from VCF text before
-    # parsing; genotypes must be unchanged and stripped fields absent.
+@pytest.mark.parametrize("force_strip", [False, True])
+def test_format_fields_lazy_parsing(tmp_path, monkeypatch, force_strip):
+    # format_fields skips unrequested FORMAT fields when parsing VCF text,
+    # either natively in htslib (bcf_hdr_set_parse_formats) or by stripping
+    # each line before parsing; genotypes must be unchanged and skipped
+    # fields absent under both implementations.
+    if force_strip:
+        monkeypatch.setenv("CYVCF2_NO_NATIVE_LAZY_FMT", "1")
     path = str(tmp_path / "lazy.vcf")
     with open(path, "w") as fh:
         fh.write("##fileformat=VCFv4.2\n")
@@ -1243,13 +1248,17 @@ def test_format_fields_lazy_parsing(tmp_path):
         # cells may drop trailing fields; missing genotypes stay missing
         fh.write("1\t200\t.\tA\tT\t30\tPASS\t.\tGT:DS:GP:DP\t"
                  "0|1:0.9\t1|1\t./.:0.5:0.1,0.4,0.5:11\n")
-        # a record whose FORMAT has none of the kept fields is left intact
+        # a record whose FORMAT has none of the kept fields keeps no data
         fh.write("1\t300\t.\tA\tT\t30\tPASS\t.\tDS:GP\t"
                  "0.9:0.1,0.9,0\t2:0,0,1\t0:1,0,0\n")
 
     full = list(VCF(path, gts012=True))
     for keep in (["GT"], ["GT", "DS"], "GT"):
         vcf = VCF(path, gts012=True, format_fields=keep)
+        if force_strip:
+            assert vcf.lazy_format_mode == "strip"
+        else:
+            assert vcf.lazy_format_mode in ("native", "strip")
         vs = list(vcf)
         kept = [keep] if isinstance(keep, str) else keep
         for i in (0, 1):
@@ -1266,7 +1275,8 @@ def test_format_fields_lazy_parsing(tmp_path):
                         assert np.array_equal(got, want, equal_nan=True), (keep, i, f)
                 else:
                     assert vs[i].format(f) is None, (keep, i, f)
-        assert vs[2].FORMAT == (["DS"] if "DS" in kept else ["DS", "GP"]), (keep, vs[2].FORMAT)
+        # a record whose FORMAT has none of the kept fields keeps no data
+        assert vs[2].FORMAT == (["DS"] if "DS" in kept else []), (keep, vs[2].FORMAT)
         vcf.close()
 
     # tabix region queries go through the same stripping

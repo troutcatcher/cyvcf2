@@ -7,6 +7,11 @@
   combined with `threads=4` for multithreaded bgzf decompression. Stripped
   fields are absent from the returned variants; ignored (with a warning) for
   BCF input.
++ when built against an htslib providing `bcf_hdr_set_parse_formats` (see
+  the `claude/lazy-format-parse` htslib branch), `format_fields` uses that
+  native lazy parsing instead of stripping lines; `VCF.lazy_format_mode`
+  reports which implementation is active ("native"/"strip"/None), and
+  setting `CYVCF2_NO_NATIVE_LAZY_FMT` forces the stripper.
 + speed up `gt_types` (012 genotype parsing): the common int8-encoded GT case
   now converts htslib's packed FORMAT data to the 012 types, allele indexes,
   and phasing in a single table-driven C pass instead of three passes over an
