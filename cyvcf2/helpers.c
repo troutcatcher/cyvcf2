@@ -13,28 +13,33 @@ static inline int32_t gt8_to_i32(int8_t v) {
 // genotype classes before HOM_ALT/UNKNOWN are mapped for gts012
 enum { GT012_HOM_REF = 0, GT012_HET = 1, GT012_HOM_ALT = 2, GT012_UNKNOWN = 3 };
 
-// classify one diploid genotype (the two raw int8 GT values); this mirrors
-// as_gts exactly, evaluated on the int32 values bcf_get_genotypes produces
-static int gt012_classify_pair(int8_t r0, int8_t r1, int strict_gt) {
-    int32_t v0 = gt8_to_i32(r0), v1 = gt8_to_i32(r1);
-    int missing = bcf_gt_is_missing(v0) + bcf_gt_is_missing(v1);
-    if (missing == 2) return GT012_UNKNOWN;
-    if (missing != 0 && strict_gt) return GT012_UNKNOWN;
-    if (v1 == bcf_int32_vector_end) {
-        int a = bcf_gt_allele(v0);
+// classify one genotype of `ploidy` raw int8 GT values into a GT012_* class.
+// This mirrors as_gts exactly: the int8 -> int32 sentinel mapping preserves
+// every comparison as_gts makes on the values bcf_get_genotypes produces.
+// The single source of truth for the 012 semantics: the diploid lookup table
+// and both generic-ploidy writers below are all derived from it.
+static int gt012_classify8(const int8_t *g, int ploidy, int strict_gt) {
+    int k, missing = 0;
+    for (k = 0; k < ploidy; k++) {
+        if (bcf_gt_is_missing(gt8_to_i32(g[k]))) missing += 1;
+    }
+    if (missing == ploidy || (missing != 0 && strict_gt)) return GT012_UNKNOWN;
+    if (ploidy == 1 || g[1] == bcf_int8_vector_end) {
+        int a = bcf_gt_allele(g[0]);
         if (a == 0) return GT012_HOM_REF;
         if (a == 1) return GT012_HOM_ALT;
         return GT012_UNKNOWN;
     }
-    int a = bcf_gt_allele(v0);
-    int b = bcf_gt_allele(v1);
-    if (a == 0 && b == 0) return GT012_HOM_REF;
-    // if a single allele is missing e.g 0/. it's still encoded as hom ref
-    // because it has no alts
-    if (missing > 0 && (a == 0 || b == 0)) return GT012_HOM_REF;
-    if (a == 1 && b == 1) return GT012_HOM_ALT;
-    if (a != b) return GT012_HET;
-    return GT012_HOM_ALT;
+    {
+        int a = bcf_gt_allele(g[0]);
+        int b = bcf_gt_allele(g[1]);
+        // 0/. counts as hom ref: a single missing allele has no alts
+        if ((a == 0 && b == 0) || (missing > 0 && (a == 0 || b == 0)))
+            return GT012_HOM_REF;
+        if (a == 1 && b == 1) return GT012_HOM_ALT;
+        if (a != b) return GT012_HET;
+        return GT012_HOM_ALT;
+    }
 }
 
 // gt012_pair_table[(r0 << 8) | r1] holds the genotype class of the diploid
@@ -53,10 +58,10 @@ static void gt012_tables_init(void) {
         int32_t v0 = gt8_to_i32(r0);
         gt_idx_table[i0] = (v0 >= 0) ? bcf_gt_allele(v0) : v0;
         for (i1 = 0; i1 < 256; i1++) {
-            int8_t r1 = (int8_t)i1;
+            int8_t g[2] = { r0, (int8_t)i1 };
             gt012_pair_table[(i0 << 8) | i1] =
-                (uint8_t)(gt012_classify_pair(r0, r1, 0) |
-                          (gt012_classify_pair(r0, r1, 1) << 4));
+                (uint8_t)(gt012_classify8(g, 2, 0) |
+                          (gt012_classify8(g, 2, 1) << 4));
         }
     }
     gt012_tables_ready = 1;
@@ -69,18 +74,18 @@ static void gt012_tables_init(void) {
 int gt_types_012_row_from_int8(const int8_t *data, int num_samples, int ploidy,
                                int strict_gt, int HOM_ALT, int UNKNOWN,
                                int8_t *out) {
-    int j = 0, i, k;
+    int j = 0, i;
     const int ngts = num_samples * ploidy;
+    int8_t class_map[4];
+    class_map[GT012_HOM_REF] = 0;
+    class_map[GT012_HET] = 1;
+    class_map[GT012_HOM_ALT] = (int8_t)HOM_ALT;
+    class_map[GT012_UNKNOWN] = (int8_t)UNKNOWN;
 
     if (!gt012_tables_ready) gt012_tables_init();
 
     if (ploidy == 2) {
         const int shift = strict_gt ? 4 : 0;
-        int8_t class_map[4];
-        class_map[GT012_HOM_REF] = 0;
-        class_map[GT012_HET] = 1;
-        class_map[GT012_HOM_ALT] = (int8_t)HOM_ALT;
-        class_map[GT012_UNKNOWN] = (int8_t)UNKNOWN;
         for (i = 0, j = 0; j < num_samples; i += 2, j++) {
             unsigned r0 = (uint8_t)data[i], r1 = (uint8_t)data[i + 1];
             out[j] = class_map[(gt012_pair_table[(r0 << 8) | r1] >> shift) & 0xF];
@@ -89,32 +94,7 @@ int gt_types_012_row_from_int8(const int8_t *data, int num_samples, int ploidy,
     }
 
     for (i = 0; i < ngts; i += ploidy) {
-        int missing = 0;
-        for (k = 0; k < ploidy; k++) {
-            if (bcf_gt_is_missing(gt8_to_i32(data[i + k]))) missing += 1;
-        }
-        if (missing == ploidy || (missing != 0 && strict_gt == 1)) {
-            out[j++] = (int8_t)UNKNOWN;
-            continue;
-        }
-        if (ploidy == 1 || data[i + 1] == bcf_int8_vector_end) {
-            int a = bcf_gt_allele(data[i]);
-            out[j++] = a == 0 ? 0 : (a == 1 ? (int8_t)HOM_ALT : (int8_t)UNKNOWN);
-            continue;
-        }
-        {
-            int a = bcf_gt_allele(data[i]);
-            int b = bcf_gt_allele(data[i + 1]);
-            if ((a == 0 && b == 0) || (missing > 0 && (a == 0 || b == 0))) {
-                out[j++] = 0; // HOM_REF (incl. e.g. 0/. which has no alts)
-            } else if (a == 1 && b == 1) {
-                out[j++] = (int8_t)HOM_ALT;
-            } else if (a != b) {
-                out[j++] = 1; // HET
-            } else {
-                out[j++] = (int8_t)HOM_ALT;
-            }
-        }
+        out[j++] = class_map[gt012_classify8(data + i, ploidy, strict_gt)];
     }
     return j;
 }
@@ -138,16 +118,16 @@ int gt_types_012_from_int8(const int8_t *data, int num_samples, int ploidy,
                            int32_t *gt_phased) {
     int j = 0, i, k;
     const int ngts = num_samples * ploidy;
+    int32_t class_map[4];
+    class_map[GT012_HOM_REF] = 0;
+    class_map[GT012_HET] = 1;
+    class_map[GT012_HOM_ALT] = HOM_ALT;
+    class_map[GT012_UNKNOWN] = UNKNOWN;
 
     if (!gt012_tables_ready) gt012_tables_init();
 
     if (ploidy == 2) {
         const int shift = strict_gt ? 4 : 0;
-        int32_t class_map[4];
-        class_map[GT012_HOM_REF] = 0;
-        class_map[GT012_HET] = 1;
-        class_map[GT012_HOM_ALT] = HOM_ALT;
-        class_map[GT012_UNKNOWN] = UNKNOWN;
         for (i = 0, j = 0; j < num_samples; i += 2, j++) {
             unsigned r0 = (uint8_t)data[i], r1 = (uint8_t)data[i + 1];
             gt_idxs[i] = gt_idx_table[r0];
@@ -159,49 +139,12 @@ int gt_types_012_from_int8(const int8_t *data, int num_samples, int ploidy,
     }
 
     for (i = 0; i < ngts; i += ploidy) {
-        int missing = 0;
         for (k = 0; k < ploidy; k++) {
             int32_t v = gt8_to_i32(data[i + k]);
             gt_idxs[i + k] = (v >= 0) ? bcf_gt_allele(v) : v;
-            if (bcf_gt_is_missing(v)) {
-                missing += 1;
-            }
         }
         gt_phased[j] = (data[i] > 0) && (i + 1 < ngts) && bcf_gt_is_phased(data[i + 1]);
-
-        if (missing == ploidy || (missing != 0 && strict_gt == 1)) {
-            gt_types[j++] = UNKNOWN;
-            continue;
-        }
-
-        if (ploidy == 1 || data[i + 1] == bcf_int8_vector_end) {
-            int a = bcf_gt_allele(data[i]);
-            if (a == 0) {
-                gt_types[j++] = 0;
-            } else if (a == 1) {
-                gt_types[j++] = HOM_ALT;
-            } else {
-                gt_types[j++] = UNKNOWN;
-            }
-            continue;
-        }
-
-        int a = bcf_gt_allele(data[i]);
-        int b = bcf_gt_allele(data[i + 1]);
-
-        if ((a == 0) && (b == 0)) {
-            gt_types[j++] = 0; // HOM_REF
-        } else if ((missing > 0) && ((a == 0) || (b == 0))) {
-            // if a single allele is missing e.g 0/. it's still encoded as hom
-            // ref because it has no alts
-            gt_types[j++] = 0; // HOM_REF
-        } else if ((a == 1) && (b == 1)) {
-            gt_types[j++] = HOM_ALT;
-        } else if (a != b) {
-            gt_types[j++] = 1; // HET
-        } else {
-            gt_types[j++] = HOM_ALT;
-        }
+        gt_types[j++] = class_map[gt012_classify8(data + i, ploidy, strict_gt)];
     }
     return j;
 }
@@ -243,7 +186,9 @@ static int keep_has(const char *keep, const char *name, int len) {
     return 0;
 }
 
-#define CYVCF2_MAX_FMT 64
+// matches htslib's MAX_N_FMT so the strip fallback and native lazy
+// parsing handle the same envelope of records
+#define CYVCF2_MAX_FMT 255
 
 // Rewrite one VCF data line in place so that only the FORMAT fields named in
 // `keep` (a comma-separated list, e.g. "GT" or "GT,DS") remain; the values of

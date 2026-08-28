@@ -341,10 +341,8 @@ cdef class VCF(HTSFile):
     cdef readonly int UNKNOWN
 
     def __cinit__(self, *args, **kwargs):
+        # all other fields are zero-initialised by the allocator
         self._gt_fmt_id = -2
-        self._strip_fmt = False
-        self._fmt_native = False
-        self._line.s, self._line.l, self._line.m = NULL, 0, 0
 
     def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None,
                  format_fields=None, parse_threads=None):
@@ -384,11 +382,14 @@ cdef class VCF(HTSFile):
                 # prefer htslib-native lazy parsing when built against an
                 # htslib providing bcf_hdr_set_parse_formats; otherwise strip
                 # unwanted fields from each line before it reaches vcf_parse.
-                if (os.environ.get("CYVCF2_NO_NATIVE_LAZY_FMT") is None and
-                        cyvcf2_hdr_set_parse_formats(<bcf_hdr_t *>self.hdr, self._fmt_keep) == 0):
+                ret = -1
+                if os.environ.get("CYVCF2_NO_NATIVE_LAZY_FMT") is None:
+                    ret = cyvcf2_hdr_set_parse_formats(<bcf_hdr_t *>self.hdr, self._fmt_keep)
+                if ret == 0:
                     self._fmt_native = True
                 else:
                     self._strip_fmt = True
+        # format_fields must be processed above so the strip fallback is known
         if parse_threads is not None and int(parse_threads) > 0:
             if self._strip_fmt:
                 # the stripping read path bypasses bcf_read, where the
@@ -601,7 +602,7 @@ cdef class VCF(HTSFile):
         cdef hts_itr_t *itr
         cdef kstring_t s
         cdef bcf1_t *b
-        cdef int slen = 1, ret = 0, newlen
+        cdef int slen = 1, ret = 0
         cdef bytes bregion
         cdef char *cregion
         cdef bint strip_fmt = self._strip_fmt
@@ -643,9 +644,7 @@ cdef class VCF(HTSFile):
                         slen = tbx_itr_next(self.hts, self.idx, itr, &s)
                         if slen > 0:
                             if strip_fmt:
-                                newlen = vcf_line_strip_format(s.s, <int>s.l, ckeep)
-                                if newlen >= 0:
-                                    s.l = <size_t>newlen
+                                _strip_ks(&s, ckeep)
                             b = bcf_init()
                             ret = vcf_parse(&s, self.hdr, b)
                     if slen <= 0:
@@ -685,9 +684,7 @@ cdef class VCF(HTSFile):
                     slen = tbx_itr_next(self.hts, self.idx, itr, &s)
                     if slen > 0:
                             if strip_fmt:
-                                newlen = vcf_line_strip_format(s.s, <int>s.l, ckeep)
-                                if newlen >= 0:
-                                    s.l = <size_t>newlen
+                                _strip_ks(&s, ckeep)
                             b = bcf_init()
                             ret = vcf_parse(&s, self.hdr, b)
                 if slen <= 0:
@@ -829,19 +826,15 @@ cdef class VCF(HTSFile):
         # unwanted FORMAT fields are removed from the text line before htslib
         # parses it, mirroring what bcf_read does internally for VCF text.
         # Returns bcf_read-style codes: >= 0 ok, -1 end-of-file, < -1 error.
-        cdef int ret, newlen
+        cdef int ret
         cdef char *ckeep
         if self._strip_fmt:
             ckeep = self._fmt_keep
             with nogil:
                 ret = hts_getline(self.hts, KS_SEP_LINE, &self._line)
-            if ret < 0:
-                return ret
-            with nogil:
-                newlen = vcf_line_strip_format(self._line.s, <int>self._line.l, ckeep)
-                if newlen >= 0:
-                    self._line.l = <size_t>newlen
-                ret = vcf_parse(&self._line, self.hdr, b)
+                if ret >= 0:
+                    _strip_ks(&self._line, ckeep)
+                    ret = vcf_parse(&self._line, self.hdr, b)
             return ret
         with nogil:
             ret = bcf_read(self.hts, self.hdr, b)
@@ -862,8 +855,25 @@ cdef class VCF(HTSFile):
         if  ret == -1:  # end-of-file
             raise StopIteration
         else:
-            raise Exception("error parsing variant with `htslib::bcf_read` error-code: %d and ret: %d" % (
-                errcode, ret))
+            raise _bcf_read_error(errcode, ret)
+
+    cdef bcf_fmt_t *_gt_fmt_int8(self, bcf1_t *b):
+        # cached-id lookup of the record's GT FORMAT field, returned only
+        # when stored as int8 (the fast-path eligible case), else NULL. The
+        # id stays -2 until a lookup succeeds so a header that gains GT
+        # later is still found.
+        cdef int gt_id
+        cdef bcf_fmt_t *fmt
+        if self._gt_fmt_id == -2:
+            gt_id = bcf_hdr_id2int(self.hdr, BCF_DT_ID, "GT")
+            if gt_id >= 0 and bcf_hdr_idinfo_exists(self.hdr, BCF_HL_FMT, gt_id) != 0:
+                self._gt_fmt_id = gt_id
+        if self._gt_fmt_id < 0:
+            return NULL
+        fmt = bcf_get_fmt_id(b, self._gt_fmt_id)
+        if fmt != NULL and fmt.type == BCF_BT_INT8 and fmt.n > 0 and fmt.p != NULL:
+            return fmt
+        return NULL
 
     def gt_types_chunk(self, int size, positions=False):
         """read up to `size` variants and return their gt_types as one matrix.
@@ -890,29 +900,26 @@ cdef class VCF(HTSFile):
         cdef int hom_alt = 2 if self.gts012 else 3
         cdef int unknown = 3 if self.gts012 else 2
         cdef int strict = self.strict_gt
-        cdef np.ndarray out = np.empty((size, n_samples), dtype=np.int8)
-        cdef np.ndarray pos = np.empty((size,), dtype=np.int64)
-        cdef int8_t *out_p = <int8_t *>np.PyArray_DATA(out)
-        cdef int64_t *pos_p = <int64_t *>np.PyArray_DATA(pos)
         cdef bint want_pos = bool(positions)
+        cdef np.ndarray out = np.empty((size, n_samples), dtype=np.int8)
+        cdef np.ndarray pos = None
+        cdef int8_t *out_p = <int8_t *>np.PyArray_DATA(out)
+        cdef int64_t *pos_p = NULL
+        if want_pos:
+            pos = np.empty((size,), dtype=np.int64)
+            pos_p = <int64_t *>np.PyArray_DATA(pos)
         cdef bcf1_t *b = bcf_init()
         cdef bcf_fmt_t *fmt
         cdef int32_t *tmp = NULL
         cdef int ntmp = 0
-        cdef int m = 0, ret = 0, gt_id, nper, n, i, errcode
+        cdef int m = 0, ret = 0, nper, n, i
         try:
             while m < size:
                 ret = self._bcf_read1(b)
                 if ret < 0 and b.errcode != BCF_ERR_CTG_UNDEF:
                     break
-                if self._gt_fmt_id == -2:
-                    gt_id = bcf_hdr_id2int(self.hdr, BCF_DT_ID, "GT")
-                    if gt_id >= 0 and bcf_hdr_idinfo_exists(self.hdr, BCF_HL_FMT, gt_id) != 0:
-                        self._gt_fmt_id = gt_id
-                fmt = NULL
-                if self._gt_fmt_id >= 0:
-                    fmt = bcf_get_fmt_id(b, self._gt_fmt_id)
-                if fmt != NULL and fmt.type == BCF_BT_INT8 and fmt.n > 0 and fmt.p != NULL:
+                fmt = self._gt_fmt_int8(b)
+                if fmt != NULL:
                     gt_types_012_row_from_int8(<int8_t *>fmt.p, n_samples, fmt.n,
                                                strict, hom_alt, unknown,
                                                out_p + <size_t>m * n_samples)
@@ -929,16 +936,15 @@ cdef class VCF(HTSFile):
                     pos_p[m] = b.pos + 1
                 m += 1
             if m < size and ret != -1:  # mirror __next__'s error behaviour
-                errcode = b.errcode
-                raise Exception("error parsing variant with `htslib::bcf_read` error-code: %d and ret: %d" % (
-                    errcode, ret))
+                raise _bcf_read_error(b.errcode, ret)
         finally:
             if tmp != NULL:
                 stdlib.free(tmp)
             bcf_destroy(b)
         if m < size:
             out.resize((m, n_samples), refcheck=False)
-            pos.resize((m,), refcheck=False)
+            if want_pos:
+                pos.resize((m,), refcheck=False)
         if want_pos:
             return out, pos
         return out
@@ -1890,9 +1896,10 @@ cdef class Variant(object):
         def __get__(self):
             cdef int ndst = 0, ngts, n, i, nper, j = 0, k = 0
             cdef int a
-            cdef int gt_id
             cdef int n_samples = self.vcf.n_samples
-            cdef bcf_fmt_t *fmt = NULL
+            cdef int hom_alt = 2 if self.vcf.gts012 else 3
+            cdef int unknown = 3 if self.vcf.gts012 else 2
+            cdef bcf_fmt_t *fmt
             if n_samples == 0:
                 return np.array([])
             if self._gt_types == NULL:
@@ -1900,26 +1907,16 @@ cdef class Variant(object):
                 # the packed data to the 012 types, allele indexes, and phasing
                 # in a single pass without the intermediate int32 copy made by
                 # bcf_get_genotypes.
-                if self.vcf._gt_fmt_id == -2:
-                    gt_id = bcf_hdr_id2int(self.vcf.hdr, BCF_DT_ID, "GT")
-                    if gt_id >= 0 and bcf_hdr_idinfo_exists(self.vcf.hdr, BCF_HL_FMT, gt_id) != 0:
-                        self.vcf._gt_fmt_id = gt_id
-                if self.vcf._gt_fmt_id >= 0:
-                    fmt = bcf_get_fmt_id(self.b, self.vcf._gt_fmt_id)
-                if fmt != NULL and fmt.type == BCF_BT_INT8 and fmt.n > 0 and fmt.p != NULL:
+                fmt = self.vcf._gt_fmt_int8(self.b)
+                if fmt != NULL:
                     nper = fmt.n
                     self._ploidy = nper
                     self._gt_types = <int32_t *>stdlib.malloc(sizeof(int32_t) * n_samples)
                     self._gt_idxs = <int *>stdlib.malloc(sizeof(int) * n_samples * nper)
                     self._gt_phased = <int *>stdlib.malloc(sizeof(int) * n_samples)
-                    if self.vcf.gts012:
-                        gt_types_012_from_int8(<int8_t *>fmt.p, n_samples, nper,
-                                               self.vcf.strict_gt, 2, 3, self._gt_types,
-                                               <int32_t *>self._gt_idxs, <int32_t *>self._gt_phased)
-                    else:
-                        gt_types_012_from_int8(<int8_t *>fmt.p, n_samples, nper,
-                                               self.vcf.strict_gt, 3, 2, self._gt_types,
-                                               <int32_t *>self._gt_idxs, <int32_t *>self._gt_phased)
+                    gt_types_012_from_int8(<int8_t *>fmt.p, n_samples, nper,
+                                           self.vcf.strict_gt, hom_alt, unknown, self._gt_types,
+                                           <int32_t *>self._gt_idxs, <int32_t *>self._gt_phased)
                 else:
                     self._gt_phased = <int *>stdlib.malloc(sizeof(int) * n_samples)
                     ngts = bcf_get_genotypes(self.vcf.hdr, self.b, &self._gt_types, &ndst)
@@ -1941,10 +1938,7 @@ cdef class Variant(object):
                         self._gt_phased[j] = self._gt_types[i] > 0 and <int>bcf_gt_is_phased(self._gt_types[i+1])
                         j += 1
 
-                    if self.vcf.gts012:
-                        n = as_gts(self._gt_types, n_samples, nper, self.vcf.strict_gt, 2, 3)
-                    else:
-                        n = as_gts(self._gt_types, n_samples, nper, self.vcf.strict_gt, 3, 2)
+                    n = as_gts(self._gt_types, n_samples, nper, self.vcf.strict_gt, hom_alt, unknown)
             cdef np.npy_intp shape[1]
             shape[0] = <np.npy_intp> n_samples
             return np.PyArray_SimpleNewFromData(1, shape, np.NPY_INT32, self._gt_types)
@@ -2696,6 +2690,19 @@ cdef inline Variant newVariant(bcf1_t *b, VCF vcf):
     i.hdr = vcf.hdr
     v.INFO = i
     return v
+
+
+cdef object _bcf_read_error(int errcode, int ret):
+    return Exception("error parsing variant with `htslib::bcf_read` error-code: %d and ret: %d" % (
+        errcode, ret))
+
+
+cdef inline void _strip_ks(kstring_t *s, const char *keep) nogil:
+    # remove unrequested FORMAT fields in place; a negative return means the
+    # line was left unmodified
+    cdef int newlen = vcf_line_strip_format(s.s, <int>s.l, keep)
+    if newlen >= 0:
+        s.l = <size_t>newlen
 
 
 cdef to_bytes(s, enc=ENC):

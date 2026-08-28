@@ -1186,22 +1186,30 @@ def test_strict_gt_option_flag():
     assert tuple(variant.genotypes) == truth_genotypes, '{} (genotypes)'.format(msg)
     """
 
-def test_gt_types_012_fast_path(tmp_path):
-    # exercise the single-pass int8 gt_types path against every genotype form
-    # and against the generic bcf_get_genotypes path (GT stored as int16 when
-    # an allele index is > 63); both records must classify identically.
-    gts8 = ["0/0", "0/1", "1/1", "0|1", "1|1", "./.", "0/.", "./1", "1/2", "2/2", ".", "0", "1"]
-    gts16 = gts8[:8] + ["1/64", "64/64"] + gts8[10:]
-    alt = ",".join("A" * (i + 2) for i in range(70))
-    path = str(tmp_path / "gt012.vcf")
+GT_CASES_8 = ["0/0", "0/1", "1/1", "0|1", "1|1", "./.", "0/.", "./1", "1/2", "2/2", ".", "0", "1"]
+GT_CASES_16 = GT_CASES_8[:8] + ["1/64", "64/64"] + GT_CASES_8[10:]  # int16-stored GT
+GT_CASES_ALT = ",".join("A" * (i + 2) for i in range(70))
+
+
+def _write_gt_cases_vcf(path, rows):
+    # rows: list of (pos, gts) written as GT-only records with 70 ALT alleles
     with open(path, "w") as fh:
         fh.write("##fileformat=VCFv4.2\n")
         fh.write("##contig=<ID=1,length=10000>\n")
         fh.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
         fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
-                 + "\t".join("S%d" % i for i in range(len(gts8))) + "\n")
-        fh.write("1\t100\t.\tA\t%s\t30\tPASS\t.\tGT\t%s\n" % (alt, "\t".join(gts8)))
-        fh.write("1\t200\t.\tA\t%s\t30\tPASS\t.\tGT\t%s\n" % (alt, "\t".join(gts16)))
+                 + "\t".join("S%d" % i for i in range(len(GT_CASES_8))) + "\n")
+        for pos, gts in rows:
+            fh.write("1\t%d\t.\tA\t%s\t30\tPASS\t.\tGT\t%s\n"
+                     % (pos, GT_CASES_ALT, "\t".join(gts)))
+
+
+def test_gt_types_012_fast_path(tmp_path):
+    # exercise the single-pass int8 gt_types path against every genotype form
+    # and against the generic bcf_get_genotypes path (GT stored as int16 when
+    # an allele index is > 63); both records must classify identically.
+    path = str(tmp_path / "gt012.vcf")
+    _write_gt_cases_vcf(path, [(100, GT_CASES_8), (200, GT_CASES_16)])
 
     expected = {
         # (gts012, strict_gt) -> gt_types for gts8 (and, by construction, gts16)
@@ -1336,19 +1344,9 @@ def test_gt_types_chunk(tmp_path):
     # the bulk reader must match per-variant gt_types across genotype forms
     # (missing, half-missing, haploid, mixed ploidy, multi-allelic, and the
     # int16-GT fallback for allele indexes > 63), flags, and chunk boundaries.
-    gts8 = ["0/0", "0/1", "1/1", "0|1", "1|1", "./.", "0/.", "./1", "1/2", "2/2", ".", "0", "1"]
-    gts16 = gts8[:8] + ["1/64", "64/64"] + gts8[10:]
-    alt = ",".join("A" * (i + 2) for i in range(70))
     path = str(tmp_path / "chunk.vcf")
-    with open(path, "w") as fh:
-        fh.write("##fileformat=VCFv4.2\n")
-        fh.write("##contig=<ID=1,length=10000>\n")
-        fh.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
-        fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
-                 + "\t".join("S%d" % i for i in range(len(gts8))) + "\n")
-        for i in range(20):
-            fh.write("1\t%d\t.\tA\t%s\t30\tPASS\t.\tGT\t%s\n"
-                     % (100 + i, alt, "\t".join(gts16 if i % 3 == 0 else gts8)))
+    _write_gt_cases_vcf(path, [(100 + i, GT_CASES_16 if i % 3 == 0 else GT_CASES_8)
+                               for i in range(20)])
 
     for f in (path, os.path.join(HERE, "test.vcf.gz")):
         for gts012 in (False, True):
@@ -1373,8 +1371,8 @@ def test_gt_types_chunk(tmp_path):
 
     # after EOF, further calls return an empty matrix
     vcf = VCF(path, gts012=True)
-    assert vcf.gt_types_chunk(1000).shape == (20, len(gts8))
-    assert vcf.gt_types_chunk(1000).shape == (0, len(gts8))
+    assert vcf.gt_types_chunk(1000).shape == (20, len(GT_CASES_8))
+    assert vcf.gt_types_chunk(1000).shape == (0, len(GT_CASES_8))
     vcf.close()
 
     # composes with format_fields
