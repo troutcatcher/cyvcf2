@@ -24,6 +24,7 @@ cdef extern from "helpers.h":
                                int strict_gt, int HOM_ALT, int UNKNOWN,
                                int32_t *gt_types, int32_t *gt_idxs,
                                int32_t *gt_phased);
+    int vcf_line_strip_format(char *line, int len, const char *keep) nogil;
     int32_t* bcf_hdr_seqlen(const bcf_hdr_t *hdr, int32_t *nseq)
 
 cdef extern from "htslib/kstring.h":
@@ -40,10 +41,14 @@ cdef extern from "htslib/hfile.h":
         pass
     hFILE *hdopen(int fd, const char *mode);
 
+cdef extern from "htslib/kseq.h":
+    const int KS_SEP_LINE
+
 cdef extern from "htslib/hts.h":
 
 
     int hts_set_threads(htsFile *fp, int n);
+    int hts_getline(htsFile *fp, int kstring_delimiter, kstring_t *str) nogil;
 
     cdef enum:
         HTS_IDX_START

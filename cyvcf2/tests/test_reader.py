@@ -1226,6 +1226,71 @@ def test_gt_types_012_fast_path(tmp_path):
         vcf.close()
 
 
+def test_format_fields_lazy_parsing(tmp_path):
+    # format_fields strips unrequested FORMAT fields from VCF text before
+    # parsing; genotypes must be unchanged and stripped fields absent.
+    path = str(tmp_path / "lazy.vcf")
+    with open(path, "w") as fh:
+        fh.write("##fileformat=VCFv4.2\n")
+        fh.write("##contig=<ID=1,length=10000>\n")
+        fh.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="g">\n')
+        fh.write('##FORMAT=<ID=DS,Number=A,Type=Float,Description="d">\n')
+        fh.write('##FORMAT=<ID=GP,Number=G,Type=Float,Description="p">\n')
+        fh.write('##FORMAT=<ID=DP,Number=1,Type=Integer,Description="dp">\n')
+        fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\tS2\n")
+        fh.write("1\t100\t.\tA\tT\t30\tPASS\t.\tGT:DS:GP:DP\t"
+                 "0|1:0.9:0.1,0.9,0:13\t1|1:2:0,0,1:7\t0|0:0:1,0,0:9\n")
+        # cells may drop trailing fields; missing genotypes stay missing
+        fh.write("1\t200\t.\tA\tT\t30\tPASS\t.\tGT:DS:GP:DP\t"
+                 "0|1:0.9\t1|1\t./.:0.5:0.1,0.4,0.5:11\n")
+        # a record whose FORMAT has none of the kept fields is left intact
+        fh.write("1\t300\t.\tA\tT\t30\tPASS\t.\tDS:GP\t"
+                 "0.9:0.1,0.9,0\t2:0,0,1\t0:1,0,0\n")
+
+    full = list(VCF(path, gts012=True))
+    for keep in (["GT"], ["GT", "DS"], "GT"):
+        vcf = VCF(path, gts012=True, format_fields=keep)
+        vs = list(vcf)
+        kept = [keep] if isinstance(keep, str) else keep
+        for i in (0, 1):
+            assert vs[i].gt_types.tolist() == full[i].gt_types.tolist(), (keep, i)
+            assert vs[i].gt_phases.tolist() == full[i].gt_phases.tolist(), (keep, i)
+            assert vs[i].genotypes == full[i].genotypes, (keep, i)
+            assert vs[i].FORMAT == kept, (keep, i, vs[i].FORMAT)
+            for f in ("DS", "GP", "DP"):
+                if f in kept:
+                    want = full[i].format(f)
+                    got = vs[i].format(f)
+                    assert (got is None) == (want is None), (keep, i, f)
+                    if got is not None:
+                        assert np.array_equal(got, want, equal_nan=True), (keep, i, f)
+                else:
+                    assert vs[i].format(f) is None, (keep, i, f)
+        assert vs[2].FORMAT == (["DS"] if "DS" in kept else ["DS", "GP"]), (keep, vs[2].FORMAT)
+        vcf.close()
+
+    # tabix region queries go through the same stripping
+    gz = os.path.join(HERE, "test.vcf.gz")
+    region = "1:10000-1400000"
+    full_r = [(v.POS, v.gt_types.tolist()) for v in VCF(gz, gts012=True)(region)]
+    gt_r = []
+    vcf = VCF(gz, gts012=True, format_fields=["GT"])
+    for v in vcf(region):
+        assert v.FORMAT == ["GT"], v.FORMAT
+        gt_r.append((v.POS, v.gt_types.tolist()))
+    assert len(full_r) > 0 and full_r == gt_r
+    vcf.close()
+
+    # BCF input: warns and leaves records intact
+    with pytest.warns(UserWarning):
+        VCF(os.path.join(HERE, "test.snpeff.bcf"), format_fields=["GT"]).close()
+
+    with pytest.raises(ValueError):
+        VCF(path, format_fields=["G:T"])
+    with pytest.raises(ValueError):
+        VCF(path, format_fields=[])
+
+
 def test_alt_repr():
     v = os.path.join(HERE, "test-alt-repr.vcf")
     vcf = VCF(v, gts012=True, strict_gt=False)

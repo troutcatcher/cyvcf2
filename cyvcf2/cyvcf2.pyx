@@ -285,6 +285,14 @@ cdef class VCF(HTSFile):
         list of samples to extract from full set in file.
     threads: int
         the number of threads to use including this reader.
+    format_fields: list
+        if given, only these FORMAT fields (e.g. ["GT"]) are parsed when
+        reading VCF text (.vcf, .vcf.gz); every other FORMAT field is stripped
+        from each record before parsing and will not be present on the
+        returned variants. This can speed up reading files with expensive
+        FORMAT fields considerably (e.g. imputed VCFs with GT:DS:GP where only
+        GT is needed). Ignored (with a warning) for BCF input, where records
+        are already binary and skipping fields would not save parsing time.
 
 
     Returns
@@ -307,6 +315,13 @@ cdef class VCF(HTSFile):
     # cached header id of the GT format field. -2 until the first successful
     # lookup so a header that gains GT later is still found.
     cdef int _gt_fmt_id
+    # when reading VCF text with format_fields=..., the comma-separated FORMAT
+    # fields to keep; unwanted fields are stripped from each line before
+    # vcf_parse so htslib never pays to convert them.
+    cdef bytes _fmt_keep
+    cdef bint _strip_fmt
+    # line buffer for the stripped-FORMAT read path
+    cdef kstring_t _line
 
     #: The constant used to indicate the the genotype is HOM_REF.
     cdef readonly int HOM_REF
@@ -319,8 +334,11 @@ cdef class VCF(HTSFile):
 
     def __cinit__(self, *args, **kwargs):
         self._gt_fmt_id = -2
+        self._strip_fmt = False
+        self._line.s, self._line.l, self._line.m = NULL, 0, 0
 
-    def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None):
+    def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None,
+                 format_fields=None):
         cdef bcf_hdr_t *hdr
         self._open_htsfile(fname, mode)
         hdr = self.hdr = bcf_hdr_read(self.hts)
@@ -339,6 +357,22 @@ cdef class VCF(HTSFile):
         self.format_types = {}
         if threads is not None:
             self.set_threads(threads)
+        if format_fields is not None:
+            if isinstance(format_fields, (basestring, bytes)):
+                format_fields = [format_fields]
+            names = []
+            for field in format_fields:
+                fb = to_bytes(field)
+                if len(fb) == 0 or b"," in fb or b":" in fb:
+                    raise ValueError("format_fields: invalid FORMAT field name %r" % field)
+                names.append(fb)
+            if len(names) == 0:
+                raise ValueError("format_fields: at least one FORMAT field is required")
+            if self.hts.format.format != vcf:
+                warnings.warn("format_fields is only applied when reading VCF text (.vcf/.vcf.gz); it is ignored for this file")
+            else:
+                self._fmt_keep = b",".join(names)
+                self._strip_fmt = True
 
     def __enter__(self):
         return self
@@ -525,9 +559,13 @@ cdef class VCF(HTSFile):
         cdef hts_itr_t *itr
         cdef kstring_t s
         cdef bcf1_t *b
-        cdef int slen = 1, ret = 0
+        cdef int slen = 1, ret = 0, newlen
         cdef bytes bregion
         cdef char *cregion
+        cdef bint strip_fmt = self._strip_fmt
+        cdef char *ckeep = NULL
+        if strip_fmt:
+            ckeep = self._fmt_keep
 
         if not region:
             self._open_index()
@@ -562,6 +600,10 @@ cdef class VCF(HTSFile):
                     with nogil:
                         slen = tbx_itr_next(self.hts, self.idx, itr, &s)
                         if slen > 0:
+                            if strip_fmt:
+                                newlen = vcf_line_strip_format(s.s, <int>s.l, ckeep)
+                                if newlen >= 0:
+                                    s.l = <size_t>newlen
                             b = bcf_init()
                             ret = vcf_parse(&s, self.hdr, b)
                     if slen <= 0:
@@ -600,6 +642,10 @@ cdef class VCF(HTSFile):
                 with nogil:
                     slen = tbx_itr_next(self.hts, self.idx, itr, &s)
                     if slen > 0:
+                            if strip_fmt:
+                                newlen = vcf_line_strip_format(s.s, <int>s.l, ckeep)
+                                if newlen >= 0:
+                                    s.l = <size_t>newlen
                             b = bcf_init()
                             ret = vcf_parse(&s, self.hdr, b)
                 if slen <= 0:
@@ -729,6 +775,9 @@ cdef class VCF(HTSFile):
             tbx_destroy(self.idx)
         if self.hidx != NULL:
             hts_idx_destroy(self.hidx)
+        if self._line.s != NULL:
+            stdlib.free(self._line.s)
+            self._line.s = NULL
 
     def __iter__(self):
         return self
@@ -736,12 +785,31 @@ cdef class VCF(HTSFile):
     def __next__(self):
 
         cdef bcf1_t *b
-        cdef int ret
+        cdef int ret, newlen
+        cdef char *ckeep
         if self.hts == NULL:
             raise Exception("attempt to iterate over closed/invalid VCF")
-        with nogil:
-            b = bcf_init()
-            ret = bcf_read(self.hts, self.hdr, b)
+        if self._strip_fmt:
+            # read the text line ourselves so unwanted FORMAT fields can be
+            # stripped before htslib parses them; this mirrors what bcf_read
+            # does internally for VCF text.
+            ckeep = self._fmt_keep
+            with nogil:
+                ret = hts_getline(self.hts, KS_SEP_LINE, &self._line)
+            if ret < 0:
+                if ret == -1:  # end-of-file
+                    raise StopIteration
+                raise Exception("error reading line from file, error-code: %d" % ret)
+            with nogil:
+                newlen = vcf_line_strip_format(self._line.s, <int>self._line.l, ckeep)
+                if newlen >= 0:
+                    self._line.l = <size_t>newlen
+                b = bcf_init()
+                ret = vcf_parse(&self._line, self.hdr, b)
+        else:
+            with nogil:
+                b = bcf_init()
+                ret = bcf_read(self.hts, self.hdr, b)
         if ret >= 0 or b.errcode == BCF_ERR_CTG_UNDEF:
             return newVariant(b, self)
         else:

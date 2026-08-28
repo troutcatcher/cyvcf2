@@ -1,4 +1,12 @@
 # v0.34.0
++ add `VCF(..., format_fields=["GT"])`: when reading VCF text (.vcf/.vcf.gz),
+  parse only the listed FORMAT fields — every other field is stripped from
+  each line by a cheap scan before it reaches htslib, so their values are
+  never converted. On a Beagle-style imputed vcf.gz (GT:DS:GP, 2000 samples x
+  34k variants) reading gt_types drops from 17.6s to 6.1s, and to 4.7s
+  combined with `threads=4` for multithreaded bgzf decompression. Stripped
+  fields are absent from the returned variants; ignored (with a warning) for
+  BCF input.
 + speed up `gt_types` (012 genotype parsing): the common int8-encoded GT case
   now converts htslib's packed FORMAT data to the 012 types, allele indexes,
   and phasing in a single table-driven C pass instead of three passes over an
