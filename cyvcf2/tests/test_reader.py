@@ -1458,6 +1458,33 @@ def test_gt_types_matrix(tmp_path):
     assert offs == sorted(offs)
 
 
+def test_gt_types_matrix_wide(tmp_path):
+    # rows wider than the SIMD block (16 samples) mixing clean diploid
+    # calls with missing, haploid, and multi-allelic ones, so vector blocks,
+    # per-block fallbacks, and the scalar tail are all exercised
+    path = str(tmp_path / "wide.vcf")
+    specials = ["./.", "0/.", ".", "0", "1/2", "2/2", "0|1"]
+    rows = []
+    for r in range(9):
+        row = [("0|1", "1/1", "0/0", "1|1")[(r + c) % 4] for c in range(45)]
+        for k, s in enumerate(specials):
+            row[(r * 7 + k * 5) % 45] = s
+        rows.append((100 + r, row))
+    with open(path, "w") as fh:
+        fh.write("##fileformat=VCFv4.2\n##contig=<ID=1,length=100000>\n"
+                 '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">\n')
+        fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+                 + "\t".join("S%d" % i for i in range(45)) + "\n")
+        for pos, gts in rows:
+            fh.write("1\t%d\t.\tA\tT,C\t.\t.\t.\tGT\t%s\n" % (pos, "\t".join(gts)))
+    for gts012 in (False, True):
+        for strict_gt in (False, True):
+            ref = np.array([v.gt_types.copy() for v in
+                            VCF(path, gts012=gts012, strict_gt=strict_gt)]).astype(np.int8)
+            got = VCF(path, gts012=gts012, strict_gt=strict_gt).gt_types_matrix()
+            assert np.array_equal(got, ref), (gts012, strict_gt)
+
+
 def test_alt_repr():
     v = os.path.join(HERE, "test-alt-repr.vcf")
     vcf = VCF(v, gts012=True, strict_gt=False)

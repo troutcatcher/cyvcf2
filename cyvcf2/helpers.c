@@ -1,5 +1,11 @@
 #include <helpers.h>
 #include <string.h>
+#include <pthread.h>
+
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#define CYVCF2_AVX2_KERNEL 1
+#endif
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 
@@ -49,9 +55,13 @@ static int gt012_classify8(const int8_t *g, int ploidy, int strict_gt) {
 // data, so precomputing every (r0, r1) pair once is a large win.
 static uint8_t gt012_pair_table[1 << 16];
 static int32_t gt_idx_table[1 << 8];
-static int gt012_tables_ready = 0;
+static pthread_once_t gt012_tables_once = PTHREAD_ONCE_INIT;
+static int gt012_avx2_ok = 0;
 
 static void gt012_tables_init(void) {
+#ifdef CYVCF2_AVX2_KERNEL
+    gt012_avx2_ok = __builtin_cpu_supports("avx2");
+#endif
     int i0, i1;
     for (i0 = 0; i0 < 256; i0++) {
         int8_t r0 = (int8_t)i0;
@@ -64,13 +74,45 @@ static void gt012_tables_init(void) {
                           (gt012_classify8(g, 2, 1) << 4));
         }
     }
-    gt012_tables_ready = 1;
 }
+
+#ifdef CYVCF2_AVX2_KERNEL
+// AVX2 kernel for one block of 16 diploid samples. GT bytes are
+// (allele+1)<<1 | phase, so the clean values - alleles 0 or 1, phased or
+// not, nothing missing - lie in [2,5], and there (byte>>1) is allele+1:
+// summing each pair with maddubs and subtracting 2 yields the alt-allele
+// count, which is the 0/1/2 class directly (hom-alt is then blended to its
+// configured code; phase and strict_gt cannot matter for clean pairs).
+// Returns 0 without writing when the block holds any other byte (missing,
+// vector_end, an allele above 1); the caller then uses the exact pair
+// table for that block.
+__attribute__((target("avx2")))
+static int gt012_row16_avx2(const int8_t *data, int hom_alt, int8_t *out)
+{
+    __m256i v = _mm256_loadu_si256((const __m256i *)data);
+    __m256i bad = _mm256_or_si256(
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(2), v),
+        _mm256_cmpgt_epi8(v, _mm256_set1_epi8(5)));
+    if (!_mm256_testz_si256(bad, bad))
+        return 0;
+    __m256i h = _mm256_and_si256(_mm256_srli_epi16(v, 1),
+                                 _mm256_set1_epi8(0x7f));
+    __m256i sums = _mm256_maddubs_epi16(h, _mm256_set1_epi8(1)); // 2..4
+    __m256i c = _mm256_sub_epi16(sums, _mm256_set1_epi16(2));
+    __m256i ha = _mm256_cmpeq_epi16(sums, _mm256_set1_epi16(4));
+    c = _mm256_blendv_epi8(c, _mm256_set1_epi16((short)hom_alt), ha);
+    __m256i packed = _mm256_packs_epi16(c, c);
+    packed = _mm256_permute4x64_epi64(packed, 0xD8);
+    _mm_storeu_si128((__m128i *)out, _mm256_castsi256_si128(packed));
+    return 1;
+}
+#endif
 
 // Row-writer used by the bulk gt_types reader: identical classification to
 // gt_types_012_from_int8 below, but writes only the int8 0/1/2/3 codes (no
 // allele indexes or phasing) straight into one row of the caller's matrix.
-// Callers hold the GIL, which serializes the lazy table initialization.
+// Runs without the GIL on parse worker threads and shard threads, hence the
+// pthread_once table initialization.
 int gt_types_012_row_from_int8(const int8_t *data, int num_samples, int ploidy,
                                int strict_gt, int HOM_ALT, int UNKNOWN,
                                int8_t *out) {
@@ -82,11 +124,30 @@ int gt_types_012_row_from_int8(const int8_t *data, int num_samples, int ploidy,
     class_map[GT012_HOM_ALT] = (int8_t)HOM_ALT;
     class_map[GT012_UNKNOWN] = (int8_t)UNKNOWN;
 
-    if (!gt012_tables_ready) gt012_tables_init();
+    pthread_once(&gt012_tables_once, gt012_tables_init);
 
     if (ploidy == 2) {
         const int shift = strict_gt ? 4 : 0;
-        for (i = 0, j = 0; j < num_samples; i += 2, j++) {
+        i = 0;
+        j = 0;
+#ifdef CYVCF2_AVX2_KERNEL
+        if (gt012_avx2_ok) {
+            for (; j + 16 <= num_samples; i += 32, j += 16) {
+                if (!gt012_row16_avx2(data + i, HOM_ALT, out + j)) {
+                    // the block has missing/haploid/multi-allelic values:
+                    // classify these 16 samples with the exact pair table
+                    int k;
+                    for (k = 0; k < 16; k++) {
+                        unsigned r0 = (uint8_t)data[i + 2*k];
+                        unsigned r1 = (uint8_t)data[i + 2*k + 1];
+                        out[j + k] = class_map[
+                            (gt012_pair_table[(r0 << 8) | r1] >> shift) & 0xF];
+                    }
+                }
+            }
+        }
+#endif
+        for (; j < num_samples; i += 2, j++) {
             unsigned r0 = (uint8_t)data[i], r1 = (uint8_t)data[i + 1];
             out[j] = class_map[(gt012_pair_table[(r0 << 8) | r1] >> shift) & 0xF];
         }
@@ -124,7 +185,7 @@ int gt_types_012_from_int8(const int8_t *data, int num_samples, int ploidy,
     class_map[GT012_HOM_ALT] = HOM_ALT;
     class_map[GT012_UNKNOWN] = UNKNOWN;
 
-    if (!gt012_tables_ready) gt012_tables_init();
+    pthread_once(&gt012_tables_once, gt012_tables_init);
 
     if (ploidy == 2) {
         const int shift = strict_gt ? 4 : 0;
