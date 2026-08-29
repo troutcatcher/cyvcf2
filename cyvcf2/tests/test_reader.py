@@ -1441,6 +1441,22 @@ def test_gt_types_matrix(tmp_path):
     assert vcf.gt_types_matrix().shape == (0, len(vcf.samples))
     vcf.close()
 
+    # the worker-side fill (parse_threads + known count) must survive a
+    # partially consumed reader: rows start at the current record
+    ref = np.array([v.gt_types.copy() for v in VCF(f, gts012=True)]).astype(np.int8)
+    vcf = VCF(f, gts012=True, format_fields=["GT"], parse_threads=2)
+    for _ in range(3):
+        next(vcf)
+    assert np.array_equal(vcf.gt_types_matrix(), ref[3:])
+    vcf.close()
+
+    # sharded reads split the file at index record boundaries and must
+    # reproduce the exact matrix (small files fall back gracefully)
+    assert np.array_equal(read_gt012(f, shards=3), ref)
+    assert np.array_equal(read_gt012(f, shards=2, transpose=True), ref.T)
+    offs = VCF(f)._shard_offsets(4)
+    assert offs == sorted(offs)
+
 
 def test_alt_repr():
     v = os.path.join(HERE, "test-alt-repr.vcf")

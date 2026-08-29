@@ -164,6 +164,79 @@ int cyvcf2_hdr_set_parse_formats(bcf_hdr_t *hdr, const char *fmts) {
 
 // use htslib's threaded VCF text parsing when this htslib provides it
 // (bcf_set_parse_threads); otherwise report -2 so the caller can warn.
+#ifdef CYVCF2_HAVE_PARSE_CB
+// Post-parse callback registered by VCF.gt_types_matrix: runs on htslib's
+// parse worker threads and writes each record's 012 row straight into the
+// preallocated matrix, so the conversion overlaps with parsing instead of
+// serializing on the reading thread. Rows are addressed by the record's file
+// ordinal; failures are flagged (not raised) and checked after the read.
+static int gt012_matrix_cb(const bcf_hdr_t *h, bcf1_t *v, int64_t ordinal,
+                           void *data) {
+    gt012_sink_t *s = (gt012_sink_t *)data;
+    int64_t row = ordinal - s->base;
+    bcf_fmt_t *fmt;
+    int8_t *out;
+    if (row < 0) return 0; // delivered before the matrix read began
+    if (row >= s->cap) {   // the index under-counted the file's records
+        __atomic_fetch_add(&s->overflow, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (bcf_unpack(v, BCF_UN_FMT) < 0) {
+        __atomic_fetch_add(&s->badrec, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    out = s->out + (size_t)row * s->n_samples;
+    fmt = s->gt_fmt_id >= 0 ? bcf_get_fmt_id(v, s->gt_fmt_id) : NULL;
+    if (fmt && fmt->type == BCF_BT_INT8 && fmt->n > 0 && fmt->p) {
+        gt_types_012_row_from_int8((int8_t *)fmt->p, s->n_samples, fmt->n,
+                                   s->strict_gt, s->hom_alt, s->unknown, out);
+    } else {
+        // GT stored wider than int8 (very many alleles), or absent
+        int32_t *tmp = NULL;
+        int ntmp = 0, i;
+        int n = bcf_get_genotypes(h, v, &tmp, &ntmp);
+        if (n <= 0 || n / s->n_samples == 0) {
+            free(tmp);
+            __atomic_fetch_add(&s->badrec, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+        as_gts(tmp, s->n_samples, n / s->n_samples, s->strict_gt, s->hom_alt,
+               s->unknown);
+        for (i = 0; i < s->n_samples; i++) out[i] = (int8_t)tmp[i];
+        free(tmp);
+    }
+    if (s->pos) s->pos[row] = v->pos + 1;
+    return 0;
+}
+#endif
+
+// virtual-offset split points for sharded reading (hts_idx_split);
+// -2 when this htslib has no such API
+int cyvcf2_idx_split(const hts_idx_t *idx, int nranges, uint64_t **starts,
+                     int *nout) {
+#ifdef CYVCF2_HAVE_IDX_SPLIT
+    return hts_idx_split(idx, nranges, starts, nout);
+#else
+    (void)idx;
+    (void)nranges;
+    *starts = NULL;
+    *nout = 0;
+    return -2;
+#endif
+}
+
+// register (or clear, sink == NULL) the matrix-fill callback on this
+// reader's threaded parser; -2 when this htslib has no such API
+int cyvcf2_set_gt012_sink(htsFile *fp, gt012_sink_t *sink) {
+#ifdef CYVCF2_HAVE_PARSE_CB
+    return bcf_set_parse_callback(fp, sink ? gt012_matrix_cb : NULL, sink);
+#else
+    (void)fp;
+    (void)sink;
+    return -2;
+#endif
+}
+
 int cyvcf2_set_parse_threads(htsFile *fp, int n) {
 #ifdef CYVCF2_HAVE_PARSE_THREADS
     return bcf_set_parse_threads(fp, n);

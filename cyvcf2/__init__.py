@@ -5,7 +5,7 @@ Reader = VCFReader = VCF
 
 
 def read_gt012(path, transpose=False, gts012=True, strict_gt=False,
-               parse_threads=None):
+               parse_threads=None, shards=None):
     """Read a whole VCF's genotypes as one 0/1/2 numpy int8 matrix.
 
     Returns an array of shape (n_variants, n_samples) with HOM_REF=0,
@@ -21,7 +21,22 @@ def read_gt012(path, transpose=False, gts012=True, strict_gt=False,
     and rows are written by a bulk C loop without creating any Variant
     objects. parse_threads adds htslib worker threads that decompress and
     parse lines in the background (e.g. parse_threads=4).
+
+    shards=N instead splits a tabix-indexed .vcf.gz into N ranges at
+    record boundaries taken from the index (hts_idx_split) and reads them
+    on N threads, each with its own decompressor and parser - this scales
+    with cores better than the parse_threads pipeline. It falls back to
+    the parse_threads path when the file cannot be sharded (no index, too
+    small, BCF, or an htslib without the API).
     """
+    if shards and int(shards) > 1 and not str(path).endswith((".bcf", ".bcf.gz")):
+        parts = _read_gt012_sharded(path, int(shards), gts012, strict_gt)
+        if parts is not None:
+            import numpy as np
+            out = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+            return out.T if transpose else out
+        if parse_threads is None:
+            parse_threads = int(shards)
     kwargs = {"gts012": gts012, "strict_gt": strict_gt}
     if not str(path).endswith((".bcf", ".bcf.gz")):
         kwargs["format_fields"] = ["GT"]
@@ -35,3 +50,49 @@ def read_gt012(path, transpose=False, gts012=True, strict_gt=False,
         return vcf.gt_types_matrix(transpose=transpose)
     finally:
         vcf.close()
+
+
+def _read_gt012_sharded(path, n, gts012, strict_gt):
+    """Split `path` into byte ranges at record boundaries from its tabix
+    index and read them in parallel, one VCF reader per thread with the
+    GIL released; returns the per-shard matrices in file order, or None
+    when the file cannot be sharded."""
+    import threading
+
+    probe = VCF(path)
+    try:
+        splits = probe._shard_offsets(n)
+    finally:
+        probe.close()
+    if not splits:
+        return None
+
+    bounds = [-1] + list(splits) + [-1]
+    readers = []
+    try:
+        for _ in range(len(bounds) - 1):
+            readers.append(VCF(path, gts012=gts012, strict_gt=strict_gt,
+                               format_fields=["GT"]))
+        if any(r.lazy_format_mode != "native" for r in readers):
+            return None  # line-stripping fallback cannot seek mid-file
+        results = [None] * len(readers)
+        errors = []
+
+        def run(i):
+            try:
+                results[i] = readers[i]._gt012_shard(bounds[i], bounds[i + 1])
+            except BaseException as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=run, args=(i,))
+                   for i in range(len(readers))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
+        return results
+    finally:
+        for r in readers:
+            r.close()

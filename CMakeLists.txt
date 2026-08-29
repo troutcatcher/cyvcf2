@@ -279,6 +279,18 @@ if(CYVCF2_HTSLIB_MODE STREQUAL "BUILTIN")
     message(STATUS "cyvcf2: htslib provides bcf_set_parse_threads; enabling threaded VCF parsing")
     target_compile_definitions(cyvcf2_extension PRIVATE CYVCF2_HAVE_PARSE_THREADS=1)
   endif()
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/htslib/htslib/vcf.h"
+       CYVCF2_PARSE_CB_DECL REGEX "int bcf_set_parse_callback *\\(")
+  if(CYVCF2_PARSE_CB_DECL)
+    message(STATUS "cyvcf2: htslib provides bcf_set_parse_callback; enabling worker-side matrix fill")
+    target_compile_definitions(cyvcf2_extension PRIVATE CYVCF2_HAVE_PARSE_CB=1)
+  endif()
+  file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/htslib/htslib/hts.h"
+       CYVCF2_IDX_SPLIT_DECL REGEX "int hts_idx_split *\\(")
+  if(CYVCF2_IDX_SPLIT_DECL)
+    message(STATUS "cyvcf2: htslib provides hts_idx_split; enabling sharded matrix reads")
+    target_compile_definitions(cyvcf2_extension PRIVATE CYVCF2_HAVE_IDX_SPLIT=1)
+  endif()
 endif()
 
 if(CYVCF2_HTSLIB_TARGET)

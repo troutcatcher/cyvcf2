@@ -330,6 +330,11 @@ cdef class VCF(HTSFile):
     cdef bint _fmt_native
     # line buffer for the stripped-FORMAT read path
     cdef kstring_t _line
+    # True when htslib's threaded VCF parser is active on this reader
+    cdef bint _parse_threads_on
+    # records consumed through sequential reads: the threaded parser's file
+    # ordinals (bcf_set_parse_callback) line up with this count
+    cdef int64_t _n_read
 
     #: The constant used to indicate the the genotype is HOM_REF.
     cdef readonly int HOM_REF
@@ -401,6 +406,8 @@ cdef class VCF(HTSFile):
                     warnings.warn("parse_threads requires an htslib providing bcf_set_parse_threads; ignored for this build")
                 elif ret != 0:
                     warnings.warn("parse_threads is only applied when reading VCF text (.vcf/.vcf.gz); it is ignored for this file")
+                else:
+                    self._parse_threads_on = True
 
     @property
     def lazy_format_mode(self):
@@ -849,6 +856,7 @@ cdef class VCF(HTSFile):
         b = bcf_init()
         ret = self._bcf_read1(b)
         if ret >= 0 or b.errcode == BCF_ERR_CTG_UNDEF:
+            self._n_read += 1
             return newVariant(b, self)
         errcode = b.errcode
         bcf_destroy(b)
@@ -935,6 +943,7 @@ cdef class VCF(HTSFile):
                 if want_pos:
                     pos_p[m] = b.pos + 1
                 m += 1
+                self._n_read += 1
             if m < size and ret != -1:  # mirror __next__'s error behaviour
                 raise _bcf_read_error(b.errcode, ret)
         finally:
@@ -998,39 +1007,75 @@ cdef class VCF(HTSFile):
         cdef int32_t *tmp = NULL
         cdef int ntmp = 0
         cdef long m = 0
-        cdef int ret = 0, nper, n, i
+        cdef int ret = 0, nper, n, i, gt_id
+        # With a known row count and htslib's threaded parser active, register
+        # a post-parse callback (bcf_set_parse_callback) that writes each row
+        # on the parse worker threads; this thread then only drains records,
+        # so the 012 conversion overlaps with parsing instead of serializing
+        # here. The buffer must never move while workers write into it, hence
+        # the requirement for an exact up-front row count.
+        cdef gt012_sink_t sink
+        cdef bint use_cb = False
+        if est > 0:
+            gt_id = bcf_hdr_id2int(self.hdr, BCF_DT_ID, "GT")
+            if gt_id >= 0 and bcf_hdr_idinfo_exists(self.hdr, BCF_HL_FMT, gt_id) == 0:
+                gt_id = -1
+            sink.out = out_p
+            sink.pos = pos_p
+            sink.base = self._n_read
+            sink.cap = cap
+            sink.n_samples = n_samples
+            sink.strict_gt = strict
+            sink.hom_alt = hom_alt
+            sink.unknown = unknown
+            sink.gt_fmt_id = gt_id
+            sink.overflow = 0
+            sink.badrec = 0
+            use_cb = self._parse_threads_on and \
+                cyvcf2_set_gt012_sink(self.hts, &sink) == 0
         try:
             while True:
                 ret = self._bcf_read1(b)
                 if ret < 0 and b.errcode != BCF_ERR_CTG_UNDEF:
                     break
-                if m == cap:  # no index, or its record count was too small
+                if m == cap and not use_cb:
+                    # no index, or its record count was too small
                     cap += cap // 2 + 1024
                     out.resize((cap, n_samples), refcheck=False)
                     out_p = <int8_t *>np.PyArray_DATA(out)
                     if want_pos:
                         pos.resize((cap,), refcheck=False)
                         pos_p = <int64_t *>np.PyArray_DATA(pos)
-                fmt = self._gt_fmt_int8(b)
-                if fmt != NULL:
-                    gt_types_012_row_from_int8(<int8_t *>fmt.p, n_samples, fmt.n,
-                                               strict, hom_alt, unknown,
-                                               out_p + <size_t>m * n_samples)
-                else:
-                    # GT stored wider than int8 (very many alleles), or absent
-                    n = bcf_get_genotypes(self.hdr, b, &tmp, &ntmp)
-                    if n <= 0 or n // n_samples == 0:
-                        raise Exception("error parsing genotypes; they may be absent from this record")
-                    nper = n // n_samples
-                    as_gts(tmp, n_samples, nper, strict, hom_alt, unknown)
-                    for i in range(n_samples):
-                        out_p[<size_t>m * n_samples + i] = <int8_t>tmp[i]
-                if want_pos:
-                    pos_p[m] = b.pos + 1
+                if not use_cb or (ret < 0 and m < cap):
+                    # everything, or a tolerated bad record (CTG_UNDEF with a
+                    # negative return) that the worker callback skipped
+                    fmt = self._gt_fmt_int8(b)
+                    if fmt != NULL:
+                        gt_types_012_row_from_int8(<int8_t *>fmt.p, n_samples, fmt.n,
+                                                   strict, hom_alt, unknown,
+                                                   out_p + <size_t>m * n_samples)
+                    else:
+                        # GT stored wider than int8 (very many alleles), or absent
+                        n = bcf_get_genotypes(self.hdr, b, &tmp, &ntmp)
+                        if n <= 0 or n // n_samples == 0:
+                            raise Exception("error parsing genotypes; they may be absent from this record")
+                        nper = n // n_samples
+                        as_gts(tmp, n_samples, nper, strict, hom_alt, unknown)
+                        for i in range(n_samples):
+                            out_p[<size_t>m * n_samples + i] = <int8_t>tmp[i]
+                    if want_pos:
+                        pos_p[m] = b.pos + 1
                 m += 1
+                self._n_read += 1
             if ret != -1:  # mirror __next__'s error behaviour
                 raise _bcf_read_error(b.errcode, ret)
+            if use_cb and sink.badrec:
+                raise Exception("error parsing genotypes; they may be absent from some records")
+            if use_cb and (sink.overflow or m > cap):
+                raise Exception("gt_types_matrix: the index under-counts the file's records; re-index the file")
         finally:
+            if use_cb:
+                cyvcf2_set_gt012_sink(self.hts, NULL)
             if tmp != NULL:
                 stdlib.free(tmp)
             bcf_destroy(b)
@@ -1043,6 +1088,120 @@ cdef class VCF(HTSFile):
         if want_pos:
             return out, pos
         return out
+
+    def _shard_offsets(self, int n):
+        # internal: virtual-offset split points from the tabix linear index
+        # (hts_idx_split), for read_gt012's sharded whole-file reads; []
+        # when there is no usable index or this htslib lacks the API
+        cdef uint64_t *starts = NULL
+        cdef int nout = 0, i
+        self._open_index()
+        if self.idx == NULL:
+            return []
+        if cyvcf2_idx_split(self.idx.idx, n, &starts, &nout) != 0:
+            return []
+        out = [starts[i] for i in range(nout)]
+        stdlib.free(starts)
+        return out
+
+    def _gt012_shard(self, int64_t start_voff, int64_t end_voff):
+        """internal: read the records whose starting virtual offset lies in
+        [start_voff, end_voff) into a fresh int8 012 matrix; a negative
+        bound means unbounded on that side. The reader must be a
+        bgzf-compressed VCF whose FORMAT parsing is htslib-native (sharded
+        read_gt012 opens one such reader per thread). The GIL is released
+        for the whole scan, so shards on separate readers run in parallel.
+        """
+        if self.hts == NULL:
+            raise Exception("attempt to read from closed/invalid VCF")
+        if self._strip_fmt:
+            raise Exception("sharded read requires htslib-native FORMAT parsing")
+        cdef int n_samples = self.n_samples
+        if n_samples == 0:
+            raise Exception("no samples in VCF")
+        cdef int hom_alt = 2 if self.gts012 else 3
+        cdef int unknown = 3 if self.gts012 else 2
+        cdef int strict = self.strict_gt
+        cdef int gt_id = bcf_hdr_id2int(self.hdr, BCF_DT_ID, "GT")
+        if gt_id >= 0 and bcf_hdr_idinfo_exists(self.hdr, BCF_HL_FMT, gt_id) == 0:
+            gt_id = -1
+        cdef BGZF *bg = self.hts.fp.bgzf
+        cdef bcf_hdr_t *hdr = <bcf_hdr_t *>self.hdr
+        cdef bcf1_t *b = bcf_init()
+        cdef bcf_fmt_t *fmt
+        cdef kstring_t line
+        cdef int8_t *buf = NULL
+        cdef int8_t *nbuf
+        cdef int32_t *tmp = NULL
+        cdef int ntmp = 0
+        cdef long cap = 0, m = 0
+        cdef int ret = 0, failed = 0, n, nper, i
+        line.s = NULL
+        line.l = line.m = 0
+        if b == NULL:
+            raise MemoryError()
+        try:
+            with nogil:
+                if start_voff >= 0 and bgzf_seek(bg, start_voff, 0) < 0:
+                    failed = 3
+                while not failed:
+                    if end_voff >= 0 and bgzf_tell(bg) >= end_voff:
+                        break
+                    ret = hts_getline(self.hts, KS_SEP_LINE, &line)
+                    if ret < 0:
+                        break
+                    ret = vcf_parse(&line, hdr, b)
+                    if ret < 0 and b.errcode != BCF_ERR_CTG_UNDEF:
+                        failed = 1
+                        break
+                    if m == cap:
+                        cap = cap + cap // 2 + 4096
+                        nbuf = <int8_t *>stdlib.realloc(buf, <size_t>cap * n_samples)
+                        if nbuf == NULL:
+                            failed = 2
+                            break
+                        buf = nbuf
+                    fmt = bcf_get_fmt_id(b, gt_id) if gt_id >= 0 else NULL
+                    if fmt != NULL and fmt.type == BCF_BT_INT8 and fmt.n > 0 \
+                            and fmt.p != NULL:
+                        gt_types_012_row_from_int8(<int8_t *>fmt.p, n_samples,
+                                                   fmt.n, strict, hom_alt,
+                                                   unknown,
+                                                   buf + <size_t>m * n_samples)
+                    else:
+                        # GT stored wider than int8, or absent: rare, so the
+                        # brief GIL round-trip does not hurt parallelism
+                        with gil:
+                            n = bcf_get_genotypes(self.hdr, b, &tmp, &ntmp)
+                            if n <= 0 or n // n_samples == 0:
+                                failed = 4
+                            else:
+                                nper = n // n_samples
+                                as_gts(tmp, n_samples, nper, strict, hom_alt,
+                                       unknown)
+                                for i in range(n_samples):
+                                    buf[<size_t>m * n_samples + i] = <int8_t>tmp[i]
+                        if failed:
+                            break
+                    m += 1
+            if failed == 1:
+                raise _bcf_read_error(b.errcode, ret)
+            if failed == 2:
+                raise MemoryError()
+            if failed == 3:
+                raise Exception("sharded read: seek to virtual offset failed")
+            if failed == 4:
+                raise Exception("error parsing genotypes; they may be absent from this record")
+            out = np.empty((m, n_samples), dtype=np.int8)
+            if m > 0:
+                memcpy(np.PyArray_DATA(out), buf, <size_t>m * n_samples)
+            return out
+        finally:
+            stdlib.free(buf)
+            if tmp != NULL:
+                stdlib.free(tmp)
+            ks_free(&line)
+            bcf_destroy(b)
 
 
     property samples:

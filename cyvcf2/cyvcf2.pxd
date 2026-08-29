@@ -30,6 +30,21 @@ cdef extern from "helpers.h":
     int vcf_line_strip_format(char *line, int len, const char *keep) nogil;
     int cyvcf2_hdr_set_parse_formats(bcf_hdr_t *hdr, const char *fmts);
     int cyvcf2_set_parse_threads(htsFile *fp, int n);
+    ctypedef struct gt012_sink_t:
+        int8_t *out
+        int64_t *pos
+        int64_t base
+        long cap
+        int n_samples
+        int strict_gt
+        int hom_alt
+        int unknown
+        int gt_fmt_id
+        long overflow
+        long badrec
+    int cyvcf2_set_gt012_sink(htsFile *fp, gt012_sink_t *sink);
+    int cyvcf2_idx_split(const hts_idx_t *idx, int nranges, uint64_t **starts,
+                         int *nout);
     int32_t* bcf_hdr_seqlen(const bcf_hdr_t *hdr, int32_t *nseq)
 
 cdef extern from "htslib/kstring.h":
@@ -59,8 +74,12 @@ cdef extern from "htslib/hts.h":
         HTS_IDX_START
 
 
+    ctypedef struct BGZF:
+        pass
+
     cdef union ufp:
         hFILE *hfile;
+        BGZF *bgzf;
 
     cdef enum htsExactFormat:
         unknown_format,
@@ -93,6 +112,10 @@ cdef extern from "htslib/hts.h":
     int hts_idx_nseq(const hts_idx_t *idx);
     int hts_idx_get_stat(const hts_idx_t* idx, int tid, uint64_t* mapped,
             uint64_t* unmapped);
+
+cdef extern from "htslib/bgzf.h":
+    int64_t bgzf_seek(BGZF *fp, int64_t pos, int whence) nogil
+    int64_t bgzf_tell(BGZF *fp) nogil  # macro, callable like a function
 
     #int hts_itr_next(BGZF *fp, hts_itr_t *iter, void *r, void *data);
     void hts_itr_destroy(hts_itr_t *iter);
@@ -298,7 +321,7 @@ cdef extern from "htslib/vcf.h":
 
 
     bcf_fmt_t *bcf_get_fmt(const bcf_hdr_t *hdr, bcf1_t *line, const char *key);
-    bcf_fmt_t *bcf_get_fmt_id(bcf1_t *line, const int id);
+    bcf_fmt_t *bcf_get_fmt_id(bcf1_t *line, const int id) nogil;
     int bcf_hdr_idinfo_exists(const bcf_hdr_t *hdr, int type, int id);
 
     int bcf_get_genotypes(const bcf_hdr_t *hdr, bcf1_t *line, int32_t **dst, int *ndst);
