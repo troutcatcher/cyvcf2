@@ -1385,6 +1385,63 @@ def test_gt_types_chunk(tmp_path):
         VCF(path).gt_types_chunk(-1)
 
 
+def test_gt_types_matrix(tmp_path):
+    from .. import read_gt012
+
+    # indexed vcf.gz: the matrix is pre-allocated from the tabix count
+    f = os.path.join(HERE, "test.vcf.gz")
+    for gts012 in (False, True):
+        ref = np.array([v.gt_types.copy() for v in
+                        VCF(f, gts012=gts012)]).astype(np.int8)
+        vcf = VCF(f, gts012=gts012)
+        assert vcf.num_records == ref.shape[0]
+        mat = vcf.gt_types_matrix()
+        vcf.close()
+        assert mat.dtype == np.int8
+        assert np.array_equal(mat, ref), gts012
+
+    ref = np.array([v.gt_types.copy() for v in VCF(f, gts012=True)]).astype(np.int8)
+    refpos = [v.POS for v in VCF(f)]
+
+    # transpose is a zero-copy (F-contiguous) view of the same values
+    t = VCF(f, gts012=True).gt_types_matrix(transpose=True)
+    assert t.shape == (ref.shape[1], ref.shape[0])
+    assert t.flags["F_CONTIGUOUS"]
+    assert np.array_equal(t, ref.T)
+
+    # positions come back untransposed
+    mat, pos = VCF(f, gts012=True).gt_types_matrix(transpose=True, positions=True)
+    assert np.array_equal(mat, ref.T)
+    assert pos.tolist() == refpos
+
+    # composes with format_fields and parse_threads
+    vcf = VCF(f, gts012=True, format_fields=["GT"], parse_threads=2)
+    assert np.array_equal(vcf.gt_types_matrix(), ref)
+    vcf.close()
+
+    # the one-call convenience wrapper
+    assert np.array_equal(read_gt012(f), ref)
+    assert np.array_equal(read_gt012(f, parse_threads=2, transpose=True), ref.T)
+    assert np.array_equal(read_gt012(f, gts012=False),
+                          np.array([v.gt_types.copy() for v in VCF(f)]).astype(np.int8))
+
+    # unindexed file: the buffer grows as records arrive, across genotype
+    # forms including the int16-GT fallback for allele indexes > 63
+    path = str(tmp_path / "matrix.vcf")
+    _write_gt_cases_vcf(path, [(100 + i, GT_CASES_16 if i % 3 == 0 else GT_CASES_8)
+                               for i in range(20)])
+    ref = np.array([v.gt_types.copy() for v in
+                    VCF(path, gts012=True, strict_gt=True)]).astype(np.int8)
+    mat = VCF(path, gts012=True, strict_gt=True).gt_types_matrix()
+    assert np.array_equal(mat, ref)
+
+    # a consumed reader yields an empty matrix
+    vcf = VCF(f, gts012=True)
+    assert vcf.gt_types_matrix().shape[0] == vcf.num_records
+    assert vcf.gt_types_matrix().shape == (0, len(vcf.samples))
+    vcf.close()
+
+
 def test_alt_repr():
     v = os.path.join(HERE, "test-alt-repr.vcf")
     vcf = VCF(v, gts012=True, strict_gt=False)

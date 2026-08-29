@@ -949,6 +949,101 @@ cdef class VCF(HTSFile):
             return out, pos
         return out
 
+    def gt_types_matrix(self, transpose=False, positions=False):
+        """read all remaining variants' gt_types into one numpy matrix.
+
+        Returns an int8 array of shape (n_variants, n_samples) whose rows
+        match `Variant.gt_types` under this reader's `gts012` and
+        `strict_gt` settings (for `gts012=True`: HOM_REF=0, HET=1,
+        HOM_ALT=2, UNKNOWN=3). With transpose=True the returned array is
+        the (n_samples, n_variants) transpose - a zero-copy view, so it is
+        F-contiguous; wrap it in np.ascontiguousarray() if C order is
+        required.
+
+        When the file has a tabix/CSI index carrying record counts (see
+        `num_records`) the matrix is allocated once, in full, up front;
+        otherwise the buffer grows as needed. Reads from the current
+        position to EOF, so call this on a freshly opened VCF for a
+        whole-file matrix. No `Variant` objects are created, making this
+        much faster than per-variant iteration, and it composes with
+        `format_fields` and `parse_threads`.
+
+        With positions=True, returns (matrix, positions) where positions
+        is an int64 numpy array of POS values (never transposed).
+        """
+        if self.hts == NULL:
+            raise Exception("attempt to read from closed/invalid VCF")
+        cdef int n_samples = self.n_samples
+        if n_samples == 0:
+            raise Exception("gt_types_matrix: no samples in VCF")
+        cdef int hom_alt = 2 if self.gts012 else 3
+        cdef int unknown = 3 if self.gts012 else 2
+        cdef int strict = self.strict_gt
+        cdef bint want_pos = bool(positions)
+        cdef long est = -1
+        try:
+            est = self._num_records()
+        except ValueError:  # no usable index: grow as we read
+            pass
+        cdef long cap = est if est > 0 else 16384
+        cdef np.ndarray out = np.empty((cap, n_samples), dtype=np.int8)
+        cdef np.ndarray pos = None
+        cdef int8_t *out_p = <int8_t *>np.PyArray_DATA(out)
+        cdef int64_t *pos_p = NULL
+        if want_pos:
+            pos = np.empty((cap,), dtype=np.int64)
+            pos_p = <int64_t *>np.PyArray_DATA(pos)
+        cdef bcf1_t *b = bcf_init()
+        cdef bcf_fmt_t *fmt
+        cdef int32_t *tmp = NULL
+        cdef int ntmp = 0
+        cdef long m = 0
+        cdef int ret = 0, nper, n, i
+        try:
+            while True:
+                ret = self._bcf_read1(b)
+                if ret < 0 and b.errcode != BCF_ERR_CTG_UNDEF:
+                    break
+                if m == cap:  # no index, or its record count was too small
+                    cap += cap // 2 + 1024
+                    out.resize((cap, n_samples), refcheck=False)
+                    out_p = <int8_t *>np.PyArray_DATA(out)
+                    if want_pos:
+                        pos.resize((cap,), refcheck=False)
+                        pos_p = <int64_t *>np.PyArray_DATA(pos)
+                fmt = self._gt_fmt_int8(b)
+                if fmt != NULL:
+                    gt_types_012_row_from_int8(<int8_t *>fmt.p, n_samples, fmt.n,
+                                               strict, hom_alt, unknown,
+                                               out_p + <size_t>m * n_samples)
+                else:
+                    # GT stored wider than int8 (very many alleles), or absent
+                    n = bcf_get_genotypes(self.hdr, b, &tmp, &ntmp)
+                    if n <= 0 or n // n_samples == 0:
+                        raise Exception("error parsing genotypes; they may be absent from this record")
+                    nper = n // n_samples
+                    as_gts(tmp, n_samples, nper, strict, hom_alt, unknown)
+                    for i in range(n_samples):
+                        out_p[<size_t>m * n_samples + i] = <int8_t>tmp[i]
+                if want_pos:
+                    pos_p[m] = b.pos + 1
+                m += 1
+            if ret != -1:  # mirror __next__'s error behaviour
+                raise _bcf_read_error(b.errcode, ret)
+        finally:
+            if tmp != NULL:
+                stdlib.free(tmp)
+            bcf_destroy(b)
+        if m < cap:
+            out.resize((m, n_samples), refcheck=False)
+            if want_pos:
+                pos.resize((m,), refcheck=False)
+        if transpose:
+            out = out.T
+        if want_pos:
+            return out, pos
+        return out
+
 
     property samples:
         "list of samples pulled from the VCF."
