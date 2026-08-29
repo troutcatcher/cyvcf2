@@ -1447,3 +1447,68 @@ def test_reader_context_manager():
         pass
     with pytest.raises(Exception, match="attempt to iterate over closed"):
         next(vcf)
+
+
+def _write_format_fields_vcf(path):
+    # GT:DS:GP plus edge shapes: omitted trailing fields, a "." FORMAT
+    # record, a record whose FORMAT lacks GT, and missing genotypes
+    with open(path, "w") as fh:
+        fh.write("""##fileformat=VCFv4.2
+##contig=<ID=1,length=100000>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DS,Number=1,Type=Float,Description="Dosage">
+##FORMAT=<ID=GP,Number=G,Type=Float,Description="Probabilities">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS0\tS1\tS2
+1\t100\t.\tA\tT\t.\t.\t.\tGT:DS:GP\t0|1:0.5:0.25,0.5,0.25\t1/1:2:0,0,1\t./.:.:.,.,.
+1\t200\t.\tA\tT\t.\t.\t.\tGT:DS:GP\t0/0:0:1,0,0\t0|1:1\t1|1
+1\t300\t.\tA\tT\t.\t.\t.\t.\t.\t.\t.
+1\t400\t.\tA\tT\t.\t.\t.\tDS:GP\t0.5:0.1,0.8,0.1\t1:0,1,0\t2:0,0,1
+1\t500\t.\tA\tT,C\t.\t.\t.\tGT:DS\t1/2:1.5\t0/2:0.5\t2/2:2
+""")
+
+
+def test_format_fields(tmp_path):
+    path = str(tmp_path / "ff.vcf")
+    _write_format_fields_vcf(path)
+
+    full = list(VCF(path, gts012=True))
+    lazy = list(VCF(path, gts012=True, format_fields=["GT", "DS"]))
+    assert len(full) == len(lazy) == 5
+
+    for f, l in zip(full, lazy):
+        # the record keeps exactly the requested fields, in file order,
+        # and their values are identical to a full parse
+        assert l.FORMAT == [x for x in f.FORMAT if x in ("GT", "DS")], f.POS
+        if "GT" in f.FORMAT:
+            assert np.array_equal(f.gt_types, l.gt_types), f.POS
+        fds, lds = f.format("DS"), l.format("DS")
+        if fds is None:
+            assert lds is None, f.POS
+        else:
+            assert np.allclose(fds, lds, equal_nan=True), f.POS
+        # dropped fields are gone, as if the file never had them
+        assert l.format("GP") is None, f.POS
+        assert "GP" not in l.FORMAT, f.POS
+
+    # keeping a field the FORMAT column doesn't always contain
+    only_gt = list(VCF(path, gts012=True, format_fields="GT"))
+    assert np.array_equal(only_gt[0].gt_types, full[0].gt_types)
+    assert only_gt[0].format("DS") is None
+    assert only_gt[3].FORMAT == []  # record 400 has no GT at all
+
+    # region queries honor format_fields (indexed test file)
+    fgz = os.path.join(HERE, "test.vcf.gz")
+    full_r = list(VCF(fgz, gts012=True)("1:10000-1500000"))
+    lazy_r = list(VCF(fgz, gts012=True, format_fields=["GT"])("1:10000-1500000"))
+    assert len(full_r) == len(lazy_r) > 0
+    for f, l in zip(full_r, lazy_r):
+        assert np.array_equal(f.gt_types, l.gt_types)
+
+    # invalid names are rejected; BCF input warns and ignores
+    with pytest.raises(ValueError):
+        VCF(path, format_fields=["GT,DS"])
+    with pytest.raises(ValueError):
+        VCF(path, format_fields=[])
+    with pytest.warns(UserWarning):
+        v = VCF(os.path.join(HERE, "test.snpeff.bcf"), format_fields=["GT"])
+        next(v)
